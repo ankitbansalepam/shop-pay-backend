@@ -14,6 +14,8 @@
 
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import express from 'express';
 import cors from 'cors';
 
@@ -30,6 +32,7 @@ const {
     BIGCOMMERCE_CREATE_ORDER = 'false',
     PORT = 8787,
     ALLOWED_ORIGIN = '',
+    SESSION_STORE_PATH = 'data/shop-pay-sessions.json',
 } = process.env;
 
 if (!SHOP_DOMAIN) console.warn('[warn] SHOP_DOMAIN is empty — set it in .env (e.g. your-store.myshopify.com)');
@@ -38,10 +41,36 @@ if (!SHOPIFY_WEBHOOK_SECRET) console.warn('[warn] SHOPIFY_WEBHOOK_SECRET is empt
 
 const STOREFRONT_ENDPOINT = `https://${SHOP_DOMAIN}/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-// POC "database": maps our sourceIdentifier -> what we know about the order.
-// Replace with a real store (Redis/Postgres) beyond POC.
 const orderMap = new Map();
 const CONFIRMATION_TOKEN_TTL_MS = 15 * 60 * 1000;
+const sessionStorePath = path.resolve(process.cwd(), SESSION_STORE_PATH);
+
+function persistOrderMap() {
+    const directory = path.dirname(sessionStorePath);
+    const temporaryPath = `${sessionStorePath}.tmp`;
+
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(temporaryPath, JSON.stringify([...orderMap.entries()], null, 2));
+    fs.renameSync(temporaryPath, sessionStorePath);
+}
+
+function loadOrderMap() {
+    try {
+        const entries = JSON.parse(fs.readFileSync(sessionStorePath, 'utf8'));
+
+        if (Array.isArray(entries)) {
+            for (const [sourceIdentifier, record] of entries) {
+                if (typeof sourceIdentifier === 'string' && record && typeof record === 'object') {
+                    orderMap.set(sourceIdentifier, record);
+                }
+            }
+        }
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            console.error('[session-store] failed to load persisted sessions:', error);
+        }
+    }
+}
 
 function isFiniteNonNegative(value) {
     return typeof value === 'number' && Number.isFinite(value) && value >= 0;
@@ -235,6 +264,7 @@ app.post('/shop-pay/session', async (req, res) => {
             status: 'session_created',
             createdAt: Date.now(),
         });
+        persistOrderMap();
 
         return res.json({
             token: session.token,
@@ -286,6 +316,7 @@ app.post('/shop-pay/submit', async (req, res) => {
             return res.json(record.submitResponse);
         }
         record.idempotencyKey = idempotencyKey;
+        persistOrderMap();
 
         // Reuse the exact paymentRequest we created the session with (server-side
         // source of truth). For POC we trust our stored copy over client input.
@@ -333,6 +364,7 @@ app.post('/shop-pay/submit', async (req, res) => {
             confirmationToken: record.confirmationToken,
         };
         record.submitResponse = response;
+        persistOrderMap();
         return res.json(response);
     } catch (err) {
         console.error('[submit] error:', err);
@@ -383,6 +415,7 @@ async function reconcileBigCommerceOrder(record) {
     }
 
     record.bigCommerceStatusId = Number(BIGCOMMERCE_PAID_STATUS_ID);
+    persistOrderMap();
     console.log(`[webhook] marked BigCommerce order ${record.bcOrderId} paid for Shopify order ${record.shopifyOrderName}`);
 }
 
@@ -411,6 +444,7 @@ async function clearBigCommerceCart(record) {
         if (response.status === 404) {
             console.log(`[shop-pay] cart ${record.bcCartId} already removed; continuing`);
             record.cartCleared = true;
+                persistOrderMap();
             return;
         }
 
@@ -420,6 +454,7 @@ async function clearBigCommerceCart(record) {
         }
 
         record.cartCleared = true;
+        persistOrderMap();
         console.log(`[shop-pay] cleared BigCommerce cart ${record.bcCartId} after order ${record.bcOrderId}`);
     } catch (err) {
         console.error('[shop-pay] failed to clear cart after order completion:', err);
@@ -492,9 +527,10 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
     const order = await response.json();
     if (!response.ok) throw new Error(`BigCommerce order creation failed: ${JSON.stringify(order)}`);
     record.bcOrderId = order.id;
+    persistOrderMap();
     await reconcileBigCommerceOrder(record);
-    await clearBigCommerceCart(record);
     record.status = 'bigcommerce_order_created';
+    persistOrderMap();
     return order.id;
 }
 
@@ -507,14 +543,20 @@ app.post('/webhooks/shopify/orders', (req, res) => {
 
     const record = sourceIdentifier && orderMap.get(sourceIdentifier);
     if (record) {
+        if (record.shopifyOrderId && String(record.shopifyOrderId) === String(order.id)) {
+            return res.status(200).send('ok');
+        }
+
         record.shopifyOrderId = order.id;
         record.shopifyOrderName = order.name;
         record.financialStatus = order.financial_status;
         record.status = 'order_reconciled';
+        persistOrderMap();
         console.log(`[webhook] linked Shopify order ${order.name} (${order.financial_status}) -> BC cart ${record.bcCartId}`);
         reconcileBigCommerceOrder(record).catch((err) => {
             console.error('[webhook] BigCommerce reconciliation error:', err);
             record.status = 'reconciliation_failed';
+            persistOrderMap();
         });
     } else {
         console.log(`[webhook] order ${order.name} with no matching sourceIdentifier=${sourceIdentifier}`);
@@ -550,6 +592,7 @@ app.get('/bigcommerce/orders/:id', async (req, res) => {
             { headers: { Accept: 'application/json', 'X-Auth-Token': BIGCOMMERCE_ACCESS_TOKEN } },
         );
         const products = productsResponse.ok ? await productsResponse.json() : [];
+        await clearBigCommerceCart(record);
 
         return res.json({
             id: order.id,
@@ -575,6 +618,9 @@ app.get('/bigcommerce/orders/:id', async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/health', (_req, res) => res.json({ ok: true, shopId: SHOP_ID, endpoint: STOREFRONT_ENDPOINT }));
 app.get('/shop-pay/orders', (_req, res) => res.json([...orderMap.values()]));
+
+loadOrderMap();
+console.log(`[session-store] loaded ${orderMap.size} persisted session(s) from ${sessionStorePath}`);
 
 app.listen(PORT, () => {
     console.log(`Shop Pay POC backend on http://localhost:${PORT}`);
