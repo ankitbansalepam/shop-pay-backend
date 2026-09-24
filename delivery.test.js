@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+    describeScheduledDelivery,
     getAvailableDeliveryDates,
     isScheduledProduct,
     validateScheduledDelivery,
@@ -42,5 +43,21 @@ describe('validateScheduledDelivery', () => {
         assert.match(validateScheduledDelivery(undefined, address, now), /required/);
         assert.match(validateScheduledDelivery({ date: '2026-09-27' }, address, now), /not available/);
         assert.match(validateScheduledDelivery({ date: '29/09/2026' }, address, now), /invalid/);
+    });
+});
+
+describe('describeScheduledDelivery', () => {
+    it('names the service and date once, with instructions', () => {
+        assert.equal(
+            describeScheduledDelivery('Green Glove Delivery – Mon, Sep 28', { date: '2026-09-28', instructions: 'Buzz 12' }),
+            'Scheduled delivery: Green Glove Delivery on Mon, Sep 28 (2026-09-28). Instructions: Buzz 12',
+        );
+    });
+
+    it('omits empty instructions', () => {
+        assert.equal(
+            describeScheduledDelivery('White Glove Delivery', { date: '2026-09-29' }),
+            'Scheduled delivery: White Glove Delivery on Tue, Sep 29 (2026-09-29)',
+        );
     });
 });

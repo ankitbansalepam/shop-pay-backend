@@ -56,3 +56,18 @@ export function validateScheduledDelivery(scheduledDelivery, address, now = new 
     }
     return null;
 }
+
+// Staff note for the BigCommerce order, e.g.
+// "Scheduled delivery: Green Glove Delivery on Mon, Sep 28 (2026-09-28). Instructions: Buzz 12".
+// The Shop Pay shipping line label already ends with " – <date>", so only the service is kept.
+export function describeScheduledDelivery(shippingLineLabel, { date, instructions = '' }) {
+    const service = String(shippingLineLabel || 'Scheduled delivery service').split(' – ')[0].trim();
+    const day = new Date(`${date}T12:00:00Z`).toLocaleDateString('en-US', {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        timeZone: 'UTC',
+    });
+
+    return `Scheduled delivery: ${service} on ${day} (${date})${instructions ? `. Instructions: ${instructions}` : ''}`;
+}

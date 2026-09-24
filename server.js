@@ -20,6 +20,7 @@ import cors from 'cors';
 
 import { createSessionStore, sessionStoreKind } from './sessionStore.js';
 import {
+    describeScheduledDelivery,
     getAvailableDeliveryDates,
     isEligibleAddress,
     isScheduledProduct,
@@ -713,7 +714,10 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
                 payment_method: 'Shop Pay',
                 ...(record.scheduledDelivery
                     ? {
-                          staff_notes: `Scheduled delivery: ${record.finalPaymentRequest?.shippingLines?.[0]?.label || 'scheduled service'} on ${record.scheduledDelivery.date}${record.scheduledDelivery.instructions ? `. Instructions: ${record.scheduledDelivery.instructions}` : ''}`,
+                          staff_notes: describeScheduledDelivery(
+                              record.finalPaymentRequest?.shippingLines?.[0]?.label,
+                              record.scheduledDelivery,
+                          ),
                           customer_message: `Delivery date: ${record.scheduledDelivery.date}${record.scheduledDelivery.instructions ? `\nDelivery instructions: ${record.scheduledDelivery.instructions}` : ''}`,
                       }
                     : {}),

@@ -56,6 +56,15 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 - `/shop-pay/submit` rejects with 422 unless the submitted total equals BigCommerce's `v3/checkouts/{cartId}` `grand_total` (cart incl. tax + selected shipping incl. tax), so the checkout must always have the Shop Pay shipping option selected.
 - Backend rules live in `validation.js`, tested with `npm test` (`node --test`).
 
+## Scheduled (truck) delivery
+
+- Products with custom field `delivery_type = scheduled` (test products 112, 113) make the cart scheduled. The backend decides (`POST /delivery/options`, product lookup cached 5 min); checkout-js has no product custom fields.
+- Services are BigCommerce shipping methods White Glove Delivery ($80) and Green Glove Delivery ($99) in the US zone (methods 3, 4); names configurable via backend `SCHEDULED_DELIVERY_SERVICES`. `filterShippingOptionsForCart` shows them only for scheduled carts.
+- Dates: mock ATP `getAvailableDeliveryDates()` in backend `delivery.js`; replace with the real ATP API (SHP-15).
+- Checkout: `ScheduledDeliveryFields` in the shipping footer; state in `scheduledDelivery.ts` (module store + sessionStorage per cart). Continue is disabled until a date is chosen.
+- Shop Pay: no top button for scheduled carts; payment step shows a note until a date is chosen; the popup gets only the chosen method with min/max delivery date; submit rejects scheduled carts without a scheduled service and available date; the order gets staff notes + customer message.
+- Only Shop Pay orders record the date; other payment methods and multi-address shipping don't yet.
+
 ## Backend safeguards
 
 - Sessions are stored in Upstash Redis (`upstash-kv-cobalt-drawer`, iad1, connected via Vercel Marketplace; env `KV_REST_API_URL`/`KV_REST_API_TOKEN`), keyed `shop-pay:session:{sourceIdentifier}` plus `shop-pay:order:{bcOrderId}`, 7-day TTL. Without those env vars `sessionStore.js` falls back to a JSON file (`SESSION_STORE_PATH`), which suits only a single local process. The startup log says which store is in use.
