@@ -19,6 +19,8 @@ import path from 'node:path';
 import express from 'express';
 import cors from 'cors';
 
+import { validateCart, validateFinalPaymentRequest, validateTotalMatchesCheckout } from './validation.js';
+
 const {
     SHOP_DOMAIN,
     SHOP_ID,
@@ -71,53 +73,6 @@ function loadOrderMap() {
             console.error('[session-store] failed to load persisted sessions:', error);
         }
     }
-}
-
-function isFiniteNonNegative(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value >= 0;
-}
-
-function validateCart(cart) {
-    if (!cart || typeof cart !== 'object') return 'Cart is required';
-    if (typeof cart.cartId !== 'string' || !cart.cartId.trim()) return 'cartId is required';
-    if (typeof cart.currencyCode !== 'string' || !/^[A-Z]{3}$/.test(cart.currencyCode)) {
-        return 'currencyCode must be a three-letter uppercase code';
-    }
-    if (!Array.isArray(cart.lineItems) || cart.lineItems.length === 0) {
-        return 'At least one cart line item is required';
-    }
-    if (cart.lineItems.length > 100) return 'Too many cart line items';
-    if (!isFiniteNonNegative(cart.subtotal) || !isFiniteNonNegative(cart.total)) {
-        return 'Cart subtotal and total must be non-negative numbers';
-    }
-
-    for (const item of cart.lineItems) {
-        if (!item || typeof item.name !== 'string' || !item.name.trim()) return 'Each item needs a name';
-        if (!Number.isInteger(item.quantity) || item.quantity <= 0) return 'Item quantities must be positive integers';
-        if (!isFiniteNonNegative(item.listPrice) && !isFiniteNonNegative(item.salePrice)) {
-            return 'Each item needs a valid price';
-        }
-    }
-
-    return null;
-}
-
-function validateFinalPaymentRequest(paymentRequest, originalPaymentRequest) {
-    const total = paymentRequest?.total;
-    if (!total || !isFiniteNonNegative(Number(total.amount))) {
-        return 'A valid final payment total is required';
-    }
-    if (total.currencyCode !== originalPaymentRequest.presentmentCurrency) {
-        return 'Final payment currency does not match the session currency';
-    }
-    if (paymentRequest.totalTax && !isFiniteNonNegative(Number(paymentRequest.totalTax.amount))) {
-        return 'Final tax amount is invalid';
-    }
-    if (paymentRequest.totalShippingPrice?.finalTotal &&
-        !isFiniteNonNegative(Number(paymentRequest.totalShippingPrice.finalTotal.amount))) {
-        return 'Final shipping amount is invalid';
-    }
-    return null;
 }
 
 const app = express();
@@ -342,6 +297,16 @@ app.post('/shop-pay/submit', async (req, res) => {
         };
         const paymentRequestError = validateFinalPaymentRequest(paymentRequest, record.paymentRequest);
         if (paymentRequestError) return res.status(422).json({ error: paymentRequestError });
+        if (BIGCOMMERCE_STORE_HASH && BIGCOMMERCE_ACCESS_TOKEN) {
+            const checkout = await getBigCommerceCheckout(record.bcCartId);
+            const totalError = validateTotalMatchesCheckout(paymentRequest, checkout);
+            if (totalError) {
+                console.warn(
+                    `[submit] ${totalError}: submitted ${paymentRequest.total?.amount}, checkout ${checkout?.grand_total}`,
+                );
+                return res.status(422).json({ error: totalError });
+            }
+        }
         const data = await storefront(SUBMIT, {
             idempotencyKey,
             token: record.token,
@@ -477,6 +442,22 @@ function mapBigCommerceAddress(address = {}) {
     };
 }
 
+async function getBigCommerceCheckout(cartId) {
+    if (!cartId) return null;
+
+    const response = await fetch(
+        `${BIGCOMMERCE_API_URL}/stores/${BIGCOMMERCE_STORE_HASH}/v3/checkouts/${encodeURIComponent(cartId)}`,
+        { headers: { Accept: 'application/json', 'X-Auth-Token': BIGCOMMERCE_ACCESS_TOKEN } },
+    );
+
+    if (!response.ok) {
+        console.warn(`[shop-pay] checkout ${cartId} lookup failed with HTTP ${response.status}`);
+        return null;
+    }
+
+    return (await response.json()).data || null;
+}
+
 // Signed-in shoppers own their cart, so its customer_id links the order to their
 // account. Read it server-side rather than trusting a customer ID from the browser.
 async function getBigCommerceCartCustomerId(cartId) {
@@ -608,13 +589,12 @@ app.get('/bigcommerce/orders/:id', async (req, res) => {
         }
 
         const response = await fetch(
-            `${BIGCOMMERCE_API_URL}/stores/${BIGCOMMERCE_STORE_HASH}/v2/orders?limit=250`,
+            `${BIGCOMMERCE_API_URL}/stores/${BIGCOMMERCE_STORE_HASH}/v2/orders/${encodeURIComponent(record.bcOrderId)}`,
             { headers: { Accept: 'application/json', 'X-Auth-Token': BIGCOMMERCE_ACCESS_TOKEN } },
         );
-        const orders = await response.json();
-        if (!response.ok) return res.status(response.status).json(orders);
-        const order = orders.find(({ id }) => String(id) === String(req.params.id));
-        if (!order) return res.status(404).json({ error: 'BigCommerce order not found' });
+        if (response.status === 404) return res.status(404).json({ error: 'BigCommerce order not found' });
+        const order = await response.json();
+        if (!response.ok) return res.status(response.status).json(order);
         const productsResponse = await fetch(
             `${BIGCOMMERCE_API_URL}/stores/${BIGCOMMERCE_STORE_HASH}/v2/orders/${order.id}/products`,
             { headers: { Accept: 'application/json', 'X-Auth-Token': BIGCOMMERCE_ACCESS_TOKEN } },
@@ -645,7 +625,6 @@ app.get('/bigcommerce/orders/:id', async (req, res) => {
 // Debug + health
 // ---------------------------------------------------------------------------
 app.get('/health', (_req, res) => res.json({ ok: true, shopId: SHOP_ID, endpoint: STOREFRONT_ENDPOINT }));
-app.get('/shop-pay/orders', (_req, res) => res.json([...orderMap.values()]));
 
 loadOrderMap();
 console.log(`[session-store] loaded ${orderMap.size} persisted session(s) from ${sessionStorePath}`);

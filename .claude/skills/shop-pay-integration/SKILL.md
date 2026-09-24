@@ -50,7 +50,10 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 
 - Shopify declines the payment inside the popup, before `paymentconfirmationrequested`, if the payment request no longer matches the delivery method shown in Shop Pay.
 - `shippingaddresschanged` updates the BigCommerce consignment, which clears its selected shipping option. `onShippingAddressChanged` re-selects one (Shop Pay's current shipping line code, then the previous option, then recommended/first) before rebuilding the payment request.
-- `deliverymethodchanged` must rebuild `shippingLines`, `totalShippingPrice`, and `total`; without it BigCommerce orders get $0 shipping.
+- `deliverymethodchanged` selects the same option in BigCommerce (`onDeliveryMethodChanged`), then rebuilds the payment request; without it BigCommerce orders get the wrong shipping.
+- `ShopPayButton` keeps a `latest` checkout state (cart, consignments, coupons, tax) that every handler updates, and rebuilds every payment request from it.
+- `/shop-pay/submit` rejects with 422 unless the submitted total equals BigCommerce's `v3/checkouts/{cartId}` `grand_total` (cart incl. tax + selected shipping incl. tax), so the checkout must always have the Shop Pay shipping option selected.
+- Backend rules live in `validation.js`, tested with `npm test` (`node --test`).
 
 ## Backend safeguards
 
