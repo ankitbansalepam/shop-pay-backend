@@ -52,7 +52,8 @@ export function validateTotalMatchesCheckout(paymentRequest, checkout) {
     const expected = Number(checkout?.grand_total);
 
     if (!Number.isFinite(expected)) return 'The BigCommerce checkout total is unavailable';
-    if (!Number.isFinite(submitted) || Math.abs(submitted - expected) > 0.005) {
+    // Allow one cent for rounding (e.g. 49.445 vs 49.45); anything larger is a real mismatch.
+    if (!Number.isFinite(submitted) || Math.abs(submitted - expected) > 0.01 + 1e-9) {
         return 'The Shop Pay total does not match the BigCommerce checkout total';
     }
     return null;

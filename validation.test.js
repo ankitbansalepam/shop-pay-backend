@@ -81,6 +81,14 @@ describe('validateTotalMatchesCheckout', () => {
         assert.equal(validateTotalMatchesCheckout({ total: { amount: '87.89' } }, checkout), null);
     });
 
+    it('accepts a total that differs only by rounding', () => {
+        assert.equal(validateTotalMatchesCheckout({ total: { amount: '49.445' } }, { grand_total: 49.45 }), null);
+    });
+
+    it('rejects a total more than one cent lower', () => {
+        assert.match(validateTotalMatchesCheckout({ total: { amount: '49.43' } }, { grand_total: 49.45 }), /does not match/);
+    });
+
     it('rejects a lower total', () => {
         assert.match(validateTotalMatchesCheckout({ total: { amount: '76.89' } }, checkout), /does not match/);
     });
