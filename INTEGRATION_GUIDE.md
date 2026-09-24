@@ -2,6 +2,7 @@
 
 This documents how Shop Pay Wallet was wired into the BigCommerce custom checkout
 (`checkout-js`) via a small Node backend (`shop-pay-backend`), end to end.
+For a step-by-step setup guide, see `checkout-js/docs/shop-pay-implementation.md`.
 
 ## Architecture overview
 
