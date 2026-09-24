@@ -19,6 +19,13 @@ import express from 'express';
 import cors from 'cors';
 
 import { createSessionStore, sessionStoreKind } from './sessionStore.js';
+import {
+    getAvailableDeliveryDates,
+    isEligibleAddress,
+    isScheduledProduct,
+    SCHEDULED_SERVICES,
+    validateScheduledDelivery,
+} from './delivery.js';
 import { validateCart, validateFinalPaymentRequest, validateTotalMatchesCheckout } from './validation.js';
 
 const {
@@ -181,6 +188,16 @@ app.post('/shop-pay/session', async (req, res) => {
             });
         }
 
+        const { scheduledDelivery } = req.body;
+        if (
+            scheduledDelivery &&
+            (typeof scheduledDelivery !== 'object' ||
+                typeof scheduledDelivery.date !== 'string' ||
+                String(scheduledDelivery.instructions || '').length > 500)
+        ) {
+            return res.status(400).json({ error: 'Invalid scheduled delivery' });
+        }
+
         const paymentRequest = buildPaymentRequest(cart);
 
         const data = await storefront(CREATE, { paymentRequest, sourceIdentifier });
@@ -200,6 +217,9 @@ app.post('/shop-pay/session', async (req, res) => {
             token: session.token,
             checkoutUrl: session.checkoutUrl,
             paymentRequest,
+            scheduledDelivery: scheduledDelivery
+                ? { date: scheduledDelivery.date, instructions: String(scheduledDelivery.instructions || '').trim() }
+                : null,
             status: 'session_created',
             createdAt: Date.now(),
         });
@@ -281,6 +301,11 @@ app.post('/shop-pay/submit', async (req, res) => {
         if (paymentRequestError) return res.status(422).json({ error: paymentRequestError });
         if (BIGCOMMERCE_STORE_HASH && BIGCOMMERCE_ACCESS_TOKEN) {
             const checkout = await getBigCommerceCheckout(record.bcCartId);
+            const deliveryError = await validateCheckoutDelivery(record, checkout);
+            if (deliveryError) {
+                console.warn(`[submit] ${sourceIdentifier}: ${deliveryError}`);
+                return res.status(422).json({ error: deliveryError });
+            }
             const totalError = validateTotalMatchesCheckout(paymentRequest, checkout);
             if (totalError) {
                 console.warn(
@@ -533,6 +558,77 @@ function mapBigCommerceAddress(address = {}) {
     };
 }
 
+const scheduledProductCache = new Map();
+const SCHEDULED_PRODUCT_CACHE_MS = 5 * 60 * 1000;
+
+// Product IDs (of those given) whose custom field marks them for scheduled delivery.
+async function getScheduledProductIds(productIds) {
+    const ids = [...new Set(productIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+    const now = Date.now();
+    const missing = ids.filter((id) => !(scheduledProductCache.get(id)?.expiresAt > now));
+
+    if (missing.length) {
+        const response = await fetch(
+            `${BIGCOMMERCE_API_URL}/stores/${BIGCOMMERCE_STORE_HASH}/v3/catalog/products?id:in=${missing.join(',')}&include=custom_fields&limit=250`,
+            { headers: { Accept: 'application/json', 'X-Auth-Token': BIGCOMMERCE_ACCESS_TOKEN } },
+        );
+        if (!response.ok) throw new Error(`BigCommerce product lookup failed with HTTP ${response.status}`);
+
+        const products = (await response.json()).data || [];
+        for (const id of missing) {
+            const product = products.find((entry) => entry.id === id);
+            scheduledProductCache.set(id, { scheduled: isScheduledProduct(product), expiresAt: now + SCHEDULED_PRODUCT_CACHE_MS });
+        }
+    }
+
+    return ids.filter((id) => scheduledProductCache.get(id)?.scheduled);
+}
+
+function checkoutProductIds(checkout) {
+    const items = checkout?.cart?.line_items || {};
+
+    return [...(items.physical_items || []), ...(items.digital_items || [])].map((item) => item.product_id);
+}
+
+// For carts with scheduled-delivery products, the BigCommerce checkout must have a
+// scheduled service selected and the session a valid date for the delivery address.
+async function validateCheckoutDelivery(record, checkout) {
+    if (!checkout) return null;
+    if (!(await getScheduledProductIds(checkoutProductIds(checkout))).length) return null;
+
+    const consignment = checkout.consignments?.[0];
+    const service = consignment?.selected_shipping_option?.description;
+    if (!SCHEDULED_SERVICES.includes(service)) return 'Choose a scheduled delivery service for this cart';
+
+    return validateScheduledDelivery(record.scheduledDelivery, {
+        countryCode: consignment.address?.country_code,
+        postalCode: consignment.address?.postal_code,
+    });
+}
+
+// Tells checkout whether the cart needs scheduled delivery and, for an address, which
+// dates are available (mock ATP; see delivery.js).
+app.post('/delivery/options', async (req, res) => {
+    try {
+        const { productIds, address } = req.body || {};
+        if (!Array.isArray(productIds) || productIds.length > 100) {
+            return res.status(400).json({ error: 'productIds must be an array' });
+        }
+
+        const scheduled = (await getScheduledProductIds(productIds)).length > 0;
+
+        return res.json({
+            scheduled,
+            services: SCHEDULED_SERVICES,
+            eligible: scheduled && address ? isEligibleAddress(address) : null,
+            dates: scheduled && address ? getAvailableDeliveryDates(address) : [],
+        });
+    } catch (err) {
+        console.error('[delivery] error:', err);
+        return res.status(500).json({ error: String(err.message || err) });
+    }
+});
+
 async function getBigCommerceCheckout(cartId) {
     if (!cartId) return null;
 
@@ -615,6 +711,12 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
                 status_id: Number(BIGCOMMERCE_PAID_STATUS_ID),
                 ...(customerId ? { customer_id: customerId } : {}),
                 payment_method: 'Shop Pay',
+                ...(record.scheduledDelivery
+                    ? {
+                          staff_notes: `Scheduled delivery: ${record.finalPaymentRequest?.shippingLines?.[0]?.label || 'scheduled service'} on ${record.scheduledDelivery.date}${record.scheduledDelivery.instructions ? `. Instructions: ${record.scheduledDelivery.instructions}` : ''}`,
+                          customer_message: `Delivery date: ${record.scheduledDelivery.date}${record.scheduledDelivery.instructions ? `\nDelivery instructions: ${record.scheduledDelivery.instructions}` : ''}`,
+                      }
+                    : {}),
                 billing_address: mapBigCommerceAddress(billingAddress || shippingAddress),
                 shipping_addresses: [mapBigCommerceAddress(shippingAddress)],
                 shipping_cost_ex_tax: String(shippingCost),
