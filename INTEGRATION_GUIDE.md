@@ -12,7 +12,7 @@ Browser (BigCommerce custom checkout, checkout-js)
 Shop Pay popup (Shopify-hosted)
         │  2. fires session/shipping/payment events
         ▼
-shop-pay-backend (Node/Express, port 8787)
+shop-pay-backend (Node/Express on Vercel)
         │  3. calls Shopify Storefront API (session create/submit)
         │  4. creates + reconciles the BigCommerce order (v2 Orders API)
         ▼
@@ -36,8 +36,8 @@ Shopify (payment processing)  +  BigCommerce (order of record)
    docs) — an existing/regular Shopify store cannot be enabled for the Shop Pay Wallet
    API. The store created for this integration is `mynewstore-9969.myshopify.com`.
 2. Install the Shop sales channel and record the **Shop ID** and **Shop Pay Client ID**.
-3. Add the checkout origin (e.g. `https://integrateshoppay.mybigcommerce.com`) to the
-   Shop Pay domain allow list.
+3. Add the checkout origin (`https://shoppaystore.mybigcommerce.com`) to the Shop Pay
+   domain allow list.
 4. Create a Storefront API access token (`STOREFRONT_API_TOKEN`) with Shop Pay Payment
    Request scopes.
 5. Create a webhook subscription for `ORDERS_CREATE` (see Step 5) and record the
@@ -58,24 +58,31 @@ Environment variables (`.env`, never committed/exposed):
 | `BIGCOMMERCE_PAID_STATUS_ID` | Status id to set once payment is confirmed (`11` = Awaiting Fulfillment) |
 | `BIGCOMMERCE_CREATE_ORDER` | `true` to enable BigCommerce order creation |
 | `ALLOWED_ORIGIN` | Comma-separated CORS allowlist (the checkout origin) |
-| `PORT` | Backend port (`8787`) |
+| `PORT` | Local backend port (`8787`); ignored on Vercel |
+| `SESSION_STORE_PATH` | Session store file; defaults to `data/shop-pay-sessions.json`, or `/tmp/shop-pay-sessions.json` on Vercel |
 
 Routes:
 
 - `POST /shop-pay/session` — builds a `ShopPayPaymentRequestInput` from the BigCommerce
   cart and calls `shopPayPaymentRequestSessionCreate` on the Storefront API. Stores the
-  session (`token`, `paymentRequest`, `sourceIdentifier`) in memory (`orderMap`), returns
-  `{ token, checkoutUrl, sourceIdentifier }` to the browser.
+  session (`token`, `paymentRequest`, `sourceIdentifier`, a random `confirmationToken`) in
+  `orderMap`, persisted to `SESSION_STORE_PATH`, and returns
+  `{ token, checkoutUrl, sourceIdentifier }` to the browser. The browser sends a unique
+  `sourceIdentifier` per attempt (`bc-{cartId}-{uuid}`).
 - `POST /shop-pay/submit` — called when the buyer clicks **Pay now**. Merges the final
   payment request (shipping lines, totals, payment method) sent by the frontend into the
   stored request, calls `shopPayPaymentRequestSessionSubmit` with a unique
-  `idempotencyKey`, then creates the BigCommerce order.
+  `idempotencyKey`, then creates the BigCommerce order and returns
+  `{ bcOrderId, confirmationToken, receipt }`. A repeated call with the same key returns
+  the stored response.
 - `POST /webhooks/shopify/orders` — verifies the `X-Shopify-Hmac-Sha256` header against
   the raw body, links the Shopify order back to our `sourceIdentifier`, and marks the
   BigCommerce order paid.
 - `GET /bigcommerce/orders/:id` — custom confirmation endpoint used by the checkout's
   order-confirmation page (see Step 6), since BigCommerce-Admin-created orders aren't
-  visible to the native Storefront order-confirmation lookup.
+  visible to the native Storefront order-confirmation lookup. Requires the
+  `X-Shop-Pay-Confirmation-Token` header (valid for 15 minutes) and deletes the
+  BigCommerce cart once the order is retrieved.
 - `GET /health` — liveness check.
 
 ### Creating the BigCommerce order
@@ -106,8 +113,12 @@ Routes:
   - `sessionrequested` → calls backend `/shop-pay/session`, completes with
     `token`/`checkoutUrl`/`sourceIdentifier` + an updated payment request.
   - `shippingaddresschanged` → calls `onShippingAddressChanged` (updates the BigCommerce
-    consignment address + reloads shipping options), completes with a rebuilt payment
-    request.
+    consignment address, reloads shipping options, and re-selects a shipping option),
+    completes with a rebuilt payment request. Updating the address clears BigCommerce's
+    selected option, so the handler re-selects Shop Pay's current delivery method, then
+    the previous option, then the recommended/first one. Without this the rebuilt request
+    has no shipping line, its total no longer matches the delivery method shown in Shop
+    Pay, and Shopify declines the payment in the popup.
   - **`deliverymethodchanged`** → when the buyer picks a shipping option **inside** the
     Shop Pay popup, this event fires with `ev.deliveryMethod`. The handler rebuilds
     `shippingLines` / `totalShippingPrice` / `total` from that selection and calls
@@ -118,19 +129,32 @@ Routes:
   - `paymentconfirmationrequested` → posts the SDK's current `session.paymentRequest`
     (which reflects all prior `complete*` updates) plus billing address and an
     idempotency key to `/shop-pay/submit`; stores the returned `bcOrderId`.
-  - `paymentcomplete` → closes the popup and calls `onPaymentComplete(bcOrderId)`.
+  - `paymentcomplete` → waits for the submit result, closes the popup and calls
+    `onPaymentComplete(bcOrderId, confirmationToken)`.
   - `windowclosed` → resets the loading state.
 - `ShopPayCheckoutControl.tsx` — the component actually rendered in checkout. Reads
-  `cart`/`consignments` from `useCheckout` (always with a selector, per repo
-  convention), and implements `onShippingAddressChanged` by calling
-  `checkoutService.updateConsignment()` + `loadShippingOptions()`.
+  `cart`/`consignments`/`billingAddress` from `useCheckout` (always with a selector, per
+  repo convention), decides placement (see Step 4), and implements
+  `onShippingAddressChanged` and `onDiscountCodesChanged` with `checkoutService`.
 
 ## Step 4 — Wiring into checkout-js core
 
-- `packages/core/src/app/payment/PaymentForm.tsx` renders
-  `<ShopPayCheckoutControl backendUrl={...} bcOrderId={checkout.orderId}
-  onPaymentComplete={props.onSubmit} />` only when a backend URL is configured — the
-  Shop Pay control is opt-in and kept out of hosted checkout by design.
+The control is mounted in two places, and exactly one of them renders (`placement`
+prop):
+
+- `packages/core/src/app/checkout/components/CheckoutHeader.tsx` renders
+  `placement="top"` ("Checkout with Shop Pay", above the checkout steps).
+- `packages/core/src/app/payment/PaymentForm.tsx` renders `placement="payment"` with
+  `bcOrderId={checkout.orderId}`, in the payment methods.
+
+The top button is shown only when a billing address and a shipping method were already
+known when checkout loaded, for example a signed-in shopper with saved addresses, or a
+digital-only cart. A shopper who enters shipping and billing during checkout sees Shop
+Pay only in the payment methods. Readiness is recorded the first time a control renders
+for a cart (`initialReadinessByCartId`), so the button doesn't jump to the top once the
+addresses are complete. Reloading the page after entering addresses shows the top
+button, because BigCommerce kept them.
+
 - `packages/core/src/app/payment/Payment.tsx` threads `checkout.orderId` down to
   `PaymentForm`.
 
@@ -169,54 +193,107 @@ these orders.
 BigCommerce's native order-confirmation page can't look up orders created via the v2
 Admin API through the Storefront API, so a custom confirmation was built instead:
 
-- `packages/utility/src/navigateToOrderConfirmation.ts` redirects to
-  `/checkout/order-confirmation?orderId=<id>&shopPay=1` instead of the native route.
-- `packages/core/src/app/order/OrderConfirmationApp.tsx` detects the `shopPay=1` query
-  param and renders `ShopPayOrderConfirmation` instead of the native Storefront lookup.
+- `navigateToShopPayOrderConfirmation` in `packages/utility/src/navigateToOrderConfirmation.ts`
+  changes the URL to
+  `/checkout/order-confirmation?orderId=<id>&shopPay=1&confirmationToken=<token>` with
+  `history.replaceState` plus a `popstate` event, an in-app navigation. A full page
+  request to the native route can 302 to the cart for externally created orders.
+- `packages/core/src/app/checkout/CheckoutPage.tsx` listens for that `popstate`, detects
+  `shopPay=1`, and renders `ShopPayOrderConfirmation` in place of checkout
+  (`OrderConfirmationApp.tsx` handles the same params on a direct load).
 - `packages/core/src/app/order/ShopPayOrderConfirmation.tsx` fetches
   `${getShopPayBackendUrl()}/bigcommerce/orders/:id` from the backend and renders
-  order id/status/products/total. It reuses `getShopPayBackendUrl()` from
+  order id/status/products/total, sending the confirmation token header. It reuses `getShopPayBackendUrl()` from
   `shop-pay-integration` rather than hardcoding a URL, so there is a single source of
   truth for the backend URL.
 
-## Local development notes
+## Deployment
 
-- Backend runs on `8787`, the checkout dev bundle loader on `8080`; both need public
-  HTTPS via `ngrok` for the BigCommerce-hosted checkout to reach them
-  (`ngrok http 8787`, `ngrok http 8080`).
-- After changing anything under `packages/shop-pay-integration` or
-  `packages/core/src/app/order`, rebuild with:
+Both apps run on Vercel (team `shop-pay`):
+
+| App | URL | How it deploys |
+| --- | --- | --- |
+| checkout-js | `https://checkout-js-weld.vercel.app/auto-loader.js` | A push to `master` auto-deploys to production. `vercel.json` builds with `NX_SKIP_NX_CACHE=true npm run build` and serves `dist`. |
+| shop-pay-backend | `https://shop-pay-backend.vercel.app` | `vercel --prod` from the backend folder (a folder upload, not git). `.vercelignore` keeps `.env` out. |
+
+- The BigCommerce store (`shoppaystore`, store hash `ocqei08gqj`) loads the checkout
+  from the Vercel `auto-loader.js`, configured in the BigCommerce control panel.
+- `shopPayConfig.ts` defaults the backend URL to the Vercel backend;
+  `window.shopPayBackendUrl` overrides it.
+- Backend env vars are Sensitive in Vercel and can't be read back. To check CORS, send
+  `OPTIONS /shop-pay/session` with the storefront `Origin`. For a new storefront domain,
+  add it to `ALLOWED_ORIGIN` and run `vercel redeploy`.
+- To confirm a checkout deploy contains a change, fetch `auto-loader.js`, then grep the
+  `checkout-*.js` chunk it lists for an identifier from the change. Shoppers need a hard
+  refresh (Ctrl+Shift+R) to pick up a new bundle.
+- Local checks before pushing:
   ```powershell
-  npx nx run core:generate
-  npx webpack --mode development
+  npx jest packages/shop-pay-integration/src packages/utility/src/navigateToOrderConfirmation.test.ts --runInBand
+  npx nx run core:build --skip-nx-cache
   ```
-- If a build fails with unrelated TypeScript errors after a clean checkout, clear the
-  webpack/ts-loader cache: `Remove-Item node_modules\.cache -Recurse -Force`.
-- Whichever ngrok URL backs `8787` must be kept in sync with the browser-side default in
-  `shopPayConfig.ts` (or set via `window.shopPayBackendUrl` in BigCommerce Script
-  Manager) — expired ngrok tunnels are the most common source of CORS/404 errors during
-  local testing.
+- If a build fails with unrelated TypeScript errors, clear the webpack/ts-loader cache:
+  `Remove-Item node_modules\.cache -Recurse -Force`.
+
+## Diagnosing a failed Shop Pay payment
+
+1. **Backend logs**: `vercel logs shop-pay-backend.vercel.app --since 30m --expand`. A
+   `POST /shop-pay/session` with no following `POST /shop-pay/submit` means Shopify
+   rejected the payment inside the popup, before asking our backend to submit.
+2. **Shopify orders**: the Admin GraphQL `orders(first: 5, reverse: true)` query shows
+   `sourceIdentifier`, `displayFinancialStatus`, and totals; match the `bc-{cartId}-…`
+   identifier to the attempt.
+3. **BigCommerce orders**: `v2/orders?sort=id:desc&limit=5` shows whether submit created
+   the order, with its shipping and totals.
+4. **The popup's own console** (right-click inside the popup → Inspect) is the only place
+   Shopify's rejection reason appears; the checkout page console shows only SDK events.
+
+## Demo video
+
+`checkout-js/scripts/record-shop-pay-demo.mjs` records a narrated end-to-end demo as
+`packages/test-framework/videos/shop-pay-demo/shop-pay-demo.mp4` (gitignored):
+
+1. Generates one narration clip per step with Windows text-to-speech (`System.Speech`).
+2. Runs a guest checkout with Playwright: add a product to the cart, enter email,
+   shipping address and method, show Shop Pay in the payment methods, and open the popup.
+   Each step's caption is held for as long as its narration lasts.
+3. Waits (up to 5 minutes) while the presenter signs in to Shop Pay and presses Pay now,
+   then records the in-app order confirmation.
+4. Uses ffmpeg to switch to the popup recording while it's open and mix the narration
+   clips in at each step's recorded time (`timeline.json`).
+
+```powershell
+$env:FFMPEG_PATH = '<path>\ffmpeg.exe'   # e.g. from npm i ffmpeg-static
+node scripts/record-shop-pay-demo.mjs
+```
+
+Optional overrides: `SHOP_PAY_DEMO_STORE_URL`, `SHOP_PAY_DEMO_PRODUCT_ID`,
+`SHOP_PAY_DEMO_EMAIL`, `SHOP_PAY_DEMO_VOICE`, `SHOP_PAY_DEMO_POPUP_TIMEOUT_MS`.
 
 ## Known limitations / follow-ups
 
-- `orderMap` is in-memory only; restart the backend loses session/reconciliation state.
-  Replace with Redis/Postgres before going beyond POC.
+- `orderMap` is persisted to a JSON file. On Vercel that file lives in `/tmp`, which is
+  per instance and ephemeral, so a submit handled by a different instance than the
+  session can fail with `Unknown sourceIdentifier`. Replace with managed Redis/Postgres
+  (e.g. Upstash) before going beyond POC.
+- Card selection inside the Shop Pay popup is controlled by Shopify. The checkout can't
+  preselect a saved card; see the last entry under Challenges.
 - There's no real BigCommerce Shop Pay payment method/gateway — orders are created
   directly via the Admin v2 API rather than through `checkoutService.submitOrder()`.
 - Product lookup during order creation is by SKU; ensure SKUs are unique and populated.
 
 ## Challenges encountered and how they were resolved
 
-- **Local HTTPS + CORS for the Shop Pay popup.** The Shop Pay SDK and the BigCommerce
-  checkout origin both require HTTPS, so the local backend (`8787`) and the checkout
-  loader (`8080`) had to be tunneled with `ngrok`. Free ngrok URLs expire/rotate on
-  every restart, which repeatedly broke CORS (`No 'Access-Control-Allow-Origin' header`)
-  until the *current* tunnel URL was re-verified and re-applied everywhere it was
-  referenced.
+- **Deploying the POC.** The Shop Pay SDK and the BigCommerce checkout origin both
+  require public HTTPS, so both apps were moved to Vercel. The backend's filesystem is
+  read-only there, which caused a 500 on `/shop-pay/session` until the session store
+  moved to `/tmp`, and every storefront origin had to be added to `ALLOWED_ORIGIN`.
+  Clean Vercel builds also exposed a loader that embedded an empty manifest
+  ("'checkout' property is not available in window") and an nx cache replay that left
+  `dist` empty; fixed in the loader build and with `NX_SKIP_NX_CACHE=true`.
 - **Stale backend URL duplicated in two places.** `shopPayConfig.ts` held the default
   backend URL, but `ShopPayOrderConfirmation.tsx` had its own separate hardcoded
-  fallback URL. Updating only one of them left the confirmation page calling an expired
-  tunnel and failing CORS/404 even after the button itself worked. Fixed by making the
+  fallback URL. Updating only one of them left the confirmation page calling an old
+  backend URL and failing CORS/404 even after the button itself worked. Fixed by making the
   confirmation page reuse the single `getShopPayBackendUrl()` helper instead of
   hardcoding a URL.
 - **Dead code left in `/shop-pay/session`.** A leftover, copy-pasted block referenced an
@@ -255,3 +332,18 @@ Admin API through the Storefront API, so a custom confirmation was built instead
 - **BigCommerce order/idempotency confusion.** Repeated Shop Pay submit retries need a
   stable `idempotencyKey` per checkout attempt (`crypto.randomUUID()` generated once per
   session and reused on retry) to avoid duplicate Shopify charges/orders during testing.
+- **Payment declined after a shipping address change.** When Shop Pay sent the shopper's
+  address, updating the BigCommerce consignment cleared its selected shipping option. The
+  rebuilt payment request had no shipping line and a lower total than the delivery method
+  still shown in Shop Pay, and the popup showed "There was an issue with your selected
+  payment method". The backend logs showed sessions with no submit. Fixed by re-selecting
+  a shipping option after the address update.
+- **Shop Pay button jumping to the top.** With one button at the top and one in the
+  payment step, a guest who filled in addresses during checkout saw the button move to
+  the top once they were complete. Placement is now decided from the checkout state when
+  checkout loads.
+- **Saved card not selected in the popup.** In some attempts the saved test card was
+  listed but not selected, and Pay now showed "There was an issue with your selected
+  payment method" until the shopper clicked the card. Card selection is owned by Shopify
+  and the Shop Pay Payment Request API has no way to preselect it; if it persists,
+  re-add the card in test mode or raise it with Shopify.
