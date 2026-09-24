@@ -33,6 +33,6 @@ This is a Node 20+ Express POC connecting BigCommerce checkout to Shopify Shop P
 - Sessions are stored in Upstash Redis (`upstash-kv-cobalt-drawer`, iad1, connected via Vercel Marketplace; env `KV_REST_API_URL`/`KV_REST_API_TOKEN`), keyed `shop-pay:session:{sourceIdentifier}` plus `shop-pay:order:{bcOrderId}`, 7-day TTL. Without those env vars `sessionStore.js` falls back to a JSON file (`SESSION_STORE_PATH`), which suits only a single local process. The startup log says which store is in use.
 - BigCommerce cart deletion occurs only after the authenticated confirmation endpoint successfully retrieves order data.
 - `/webhooks/shopify/orders` verifies HMAC and ignores duplicate deliveries for the same Shopify order. Set a real `SHOPIFY_WEBHOOK_SECRET` before enabling webhook processing; an empty value intentionally rejects webhook requests.
-- Current flow creates the BigCommerce order during `/shop-pay/submit` and uses the Shopify webhook for reconciliation. Do not describe this as fully webhook-created order flow unless that contract is explicitly changed.
+- `/shop-pay/submit` only submits the payment. `/shop-pay/complete` creates the BigCommerce order once the Admin API shows a PAID/AUTHORIZED Shopify order with the same `sourceIdentifier` and a matching total; it answers 202 while the order is pending. Never create the BigCommerce order at submit: the payment can still fail afterwards.
 
 Do not change Shopify API versions, GraphQL fields, or payment-flow semantics without checking the relevant Shopify contract.

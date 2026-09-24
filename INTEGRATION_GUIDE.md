@@ -74,9 +74,14 @@ Routes:
 - `POST /shop-pay/submit` — called when the buyer clicks **Pay now**. Merges the final
   payment request (shipping lines, totals, payment method) sent by the frontend into the
   stored request, calls `shopPayPaymentRequestSessionSubmit` with a unique
-  `idempotencyKey`, then creates the BigCommerce order and returns
-  `{ bcOrderId, confirmationToken, receipt }`. A repeated call with the same key returns
-  the stored response.
+  `idempotencyKey`, and returns the receipt. This only starts payment processing, so no
+  BigCommerce order is created here. A repeated call with the same key returns the
+  stored response.
+- `POST /shop-pay/complete` — called when Shop Pay reports the payment complete. Finds
+  the Shopify order for the session through the Admin API, checks it is paid and its
+  total matches, then creates the BigCommerce order and returns
+  `{ bcOrderId, confirmationToken }`. Answers 202 while Shopify is still creating the
+  order; the checkout retries.
 - `POST /webhooks/shopify/orders` — verifies the `X-Shopify-Hmac-Sha256` header against
   the raw body, links the Shopify order back to our `sourceIdentifier`, and marks the
   BigCommerce order paid.
@@ -130,9 +135,9 @@ Routes:
     this integration.
   - `paymentconfirmationrequested` → posts the SDK's current `session.paymentRequest`
     (which reflects all prior `complete*` updates) plus billing address and an
-    idempotency key to `/shop-pay/submit`; stores the returned `bcOrderId`.
-  - `paymentcomplete` → waits for the submit result, closes the popup and calls
-    `onPaymentComplete(bcOrderId, confirmationToken)`.
+    idempotency key to `/shop-pay/submit`.
+  - `paymentcomplete` → calls `/shop-pay/complete` (retrying while it answers 202),
+    closes the popup and calls `onPaymentComplete(bcOrderId, confirmationToken)`.
   - `windowclosed` → resets the loading state.
 - `ShopPayCheckoutControl.tsx` — the component actually rendered in checkout. Reads
   `cart`/`consignments`/`billingAddress` from `useCheckout` (always with a selector, per
@@ -183,8 +188,8 @@ one:
   on a normal Shopify order. Verified via the Admin GraphQL `orders` query that
   `displayFinancialStatus` is `PAID` and totals match the corresponding BigCommerce
   order.
-- **BigCommerce** — created by `createBigCommerceOrder()` immediately after the Shopify
-  submit succeeds. This is the merchant's order of record and fulfillment source.
+- **BigCommerce** — created by `createBigCommerceOrder()` in `/shop-pay/complete`, once
+  the Shopify order is paid. This is the merchant's order of record and fulfillment source.
 
 If a Shopify order isn't visible, check that you're logged into the exact store used
 for Shop Pay Wallet signup (see Step 1) — a regular/second Shopify store won't show
@@ -350,3 +355,11 @@ Optional overrides: `SHOP_PAY_DEMO_STORE_URL`, `SHOP_PAY_DEMO_PRODUCT_ID`,
   instance's own `/tmp` file, so when Pay now reached a different instance than the
   one that created the session, the session wasn't found. Fixed by moving sessions to
   Upstash Redis, connected through the Vercel Marketplace.
+- **BigCommerce order marked paid but never charged.** The backend created the
+  BigCommerce order as soon as `shopPayPaymentRequestSessionSubmit` returned, but submit
+  only starts payment processing. When one payment then failed in the popup, order 115
+  stayed "paid" with no Shopify charge. The same attempt had created two Shopify
+  sessions, because Shop Pay fired `sessionrequested` twice, so the popup paid one while
+  the backend submitted the other. Fixed by creating the BigCommerce order in
+  `/shop-pay/complete` only after the Admin API shows a paid Shopify order for the
+  session, and by creating one session per attempt.

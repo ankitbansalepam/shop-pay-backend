@@ -33,10 +33,11 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 
 1. Shop Pay button click creates a session; never create sessions during render or mount.
 2. Each new attempt uses a unique `sourceIdentifier` (`bc-{cartId}-{uuid}`). Reuse the idempotency key only inside that attempt.
-3. `paymentcomplete` must wait for backend submit completion and require both `bcOrderId` and `confirmationToken`.
-4. The confirmation URL must remain `/checkout/order-confirmation?orderId=...&shopPay=1&confirmationToken=...`.
-5. Use in-app `history.replaceState` plus `popstate` and render `ShopPayOrderConfirmation` from `CheckoutPage`; a full native route request can 302 to cart for externally created orders.
-6. Delete the BigCommerce cart only after the authenticated confirmation endpoint retrieves the order.
+3. Pay now (`paymentconfirmationrequested`) only submits the payment. On `paymentcomplete`, `completeShopPaySession` calls `/shop-pay/complete`, which returns `{ bcOrderId, confirmationToken }` once Shopify has a PAID order for the session (202 while pending; the client retries about 6 × 2s). Never create the BigCommerce order at submit: a payment can still fail afterwards (order 115 was left paid but uncharged).
+4. One backend session per click (`backendSessionRequest ??=`); the backend also returns the existing Shopify session for a repeated `sourceIdentifier`.
+5. The confirmation URL must remain `/checkout/order-confirmation?orderId=...&shopPay=1&confirmationToken=...`.
+6. Use in-app `history.replaceState` plus `popstate` and render `ShopPayOrderConfirmation` from `CheckoutPage`; a full native route request can 302 to cart for externally created orders.
+7. Delete the BigCommerce cart only after the authenticated confirmation endpoint retrieves the order.
 
 ## Button placement
 
@@ -60,7 +61,7 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 - Sessions are stored in Upstash Redis (`upstash-kv-cobalt-drawer`, iad1, connected via Vercel Marketplace; env `KV_REST_API_URL`/`KV_REST_API_TOKEN`), keyed `shop-pay:session:{sourceIdentifier}` plus `shop-pay:order:{bcOrderId}`, 7-day TTL. Without those env vars `sessionStore.js` falls back to a JSON file (`SESSION_STORE_PATH`), which suits only a single local process. The startup log says which store is in use.
 - Verify webhook HMAC using the raw request body and set a real `SHOPIFY_WEBHOOK_SECRET` before enabling webhook processing.
 - Treat duplicate Shopify order webhooks as idempotent.
-- Current flow creates the BigCommerce order during `/shop-pay/submit`; the webhook reconciles it. Do not claim full webhook-created order flow without changing this contract.
+- `/shop-pay/complete` confirms payment by finding the Shopify order whose `sourceIdentifier` matches, through the Admin API (`ADMIN_API_TOKEN`), and checks it is PAID/AUTHORIZED with a total within one cent. Only then does it create the BigCommerce order (or reconcile a pre-existing `bcOrderId`). The webhook is not needed for this and still has no secret registered.
 
 ## Diagnosing a failed Shop Pay payment
 
@@ -99,5 +100,5 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 
 - Core MVP flow is implemented: Shop Pay session, payment request, address/delivery updates, discount updates, submit, BigCommerce order creation, confirmation display, and delayed cart cleanup.
 - Remaining MVP work: ATP eligibility checks and ATP delivery time slots (SHP-06, SHP-15, SHP-25).
-- Partially implemented: webhook setup/order reconciliation (listener and duplicate protection exist, but current BigCommerce creation is submit-time). Session persistence (SHP-12) is done: Upstash Redis.
+- Partially implemented: webhook setup/order reconciliation (listener and duplicate protection exist; the BigCommerce order is created by `/shop-pay/complete` after Shopify reports it paid, not by the webhook). Session persistence (SHP-12) is done: Upstash Redis.
 - Out of scope per the sheet: CI/CD, reconciliation job, fulfillment sync/monitoring, fraud integration, OmniTracks, truck eligibility extension, and Google address correction.
