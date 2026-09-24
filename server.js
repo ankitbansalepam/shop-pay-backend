@@ -477,6 +477,31 @@ function mapBigCommerceAddress(address = {}) {
     };
 }
 
+// Signed-in shoppers own their cart, so its customer_id links the order to their
+// account. Read it server-side rather than trusting a customer ID from the browser.
+async function getBigCommerceCartCustomerId(cartId) {
+    if (!cartId) return 0;
+
+    try {
+        const response = await fetch(
+            `${BIGCOMMERCE_API_URL}/stores/${BIGCOMMERCE_STORE_HASH}/v3/carts/${encodeURIComponent(cartId)}`,
+            { headers: { Accept: 'application/json', 'X-Auth-Token': BIGCOMMERCE_ACCESS_TOKEN } },
+        );
+
+        if (!response.ok) {
+            console.warn(`[shop-pay] cart ${cartId} lookup failed with HTTP ${response.status}; creating a guest order`);
+            return 0;
+        }
+
+        const cart = await response.json();
+
+        return Number(cart.data?.customer_id) || 0;
+    } catch (err) {
+        console.warn(`[shop-pay] cart ${cartId} lookup failed; creating a guest order:`, err);
+        return 0;
+    }
+}
+
 async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
     if (BIGCOMMERCE_CREATE_ORDER !== 'true' || record.bcOrderId) return null;
     if (!BIGCOMMERCE_STORE_HASH || !BIGCOMMERCE_ACCESS_TOKEN) {
@@ -495,6 +520,7 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
         products.push({ product_id: product.id, quantity: item.quantity });
     }
 
+    const customerId = await getBigCommerceCartCustomerId(record.bcCartId);
     const shippingAddress = paymentRequest.shippingAddress || billingAddress || {};
     const shippingCost =
         paymentRequest.totalShippingPrice?.finalTotal?.amount ??
@@ -515,6 +541,7 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
             },
             body: JSON.stringify({
                 status_id: Number(BIGCOMMERCE_PAID_STATUS_ID),
+                ...(customerId ? { customer_id: customerId } : {}),
                 payment_method: 'Shop Pay',
                 billing_address: mapBigCommerceAddress(billingAddress || shippingAddress),
                 shipping_addresses: [mapBigCommerceAddress(shippingAddress)],
