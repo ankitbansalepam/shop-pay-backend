@@ -33,6 +33,7 @@ async function redis(command) {
 
 function createFileStore(filePath) {
     const records = new Map();
+    const locks = new Set();
 
     try {
         const entries = JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -71,6 +72,14 @@ function createFileStore(filePath) {
                 [...records.values()].find((record) => String(record.bcOrderId) === String(bcOrderId)) || null
             );
         },
+        async lock(name) {
+            if (locks.has(name)) return false;
+            locks.add(name);
+            return true;
+        },
+        async unlock(name) {
+            locks.delete(name);
+        },
     };
 }
 
@@ -91,6 +100,13 @@ const redisStore = {
         const sourceIdentifier = await redis(['GET', orderKey(bcOrderId)]);
 
         return sourceIdentifier ? this.get(sourceIdentifier) : null;
+    },
+    // Atomic across instances (SET NX); expires on its own if the holder crashes.
+    async lock(name, ttlSeconds = 30) {
+        return (await redis(['SET', `shop-pay:lock:${name}`, '1', 'NX', 'EX', ttlSeconds])) === 'OK';
+    },
+    async unlock(name) {
+        await redis(['DEL', `shop-pay:lock:${name}`]);
     },
 };
 

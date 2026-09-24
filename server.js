@@ -354,14 +354,27 @@ async function findShopifyOrder(record) {
 }
 
 app.post('/shop-pay/complete', async (req, res) => {
+    let completeLock;
+
     try {
         const { sourceIdentifier } = req.body || {};
         if (typeof sourceIdentifier !== 'string' || sourceIdentifier.length > 200) {
             return res.status(400).json({ error: 'Invalid sourceIdentifier' });
         }
 
-        const record = await sessionStore.get(sourceIdentifier);
+        let record = await sessionStore.get(sourceIdentifier);
         if (!record) return res.status(404).json({ error: 'Unknown sourceIdentifier — create a session first' });
+        if (record.completedAt) {
+            return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
+        }
+
+        // Only one call may create the BigCommerce order; a concurrent call is told to
+        // retry, and then receives the order the first call created.
+        if (!(await sessionStore.lock(`complete:${sourceIdentifier}`))) {
+            return res.status(202).json({ pending: true });
+        }
+        completeLock = `complete:${sourceIdentifier}`;
+        record = await sessionStore.get(sourceIdentifier);
         if (record.completedAt) {
             return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
         }
@@ -409,6 +422,10 @@ app.post('/shop-pay/complete', async (req, res) => {
     } catch (err) {
         console.error('[complete] error:', err);
         return res.status(500).json({ error: String(err.message || err) });
+    } finally {
+        if (completeLock) {
+            await sessionStore.unlock(completeLock).catch((err) => console.error('[complete] unlock failed:', err));
+        }
     }
 });
 
