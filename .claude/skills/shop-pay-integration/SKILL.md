@@ -41,7 +41,8 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 ## Button placement
 
 - `CheckoutHeader` renders `placement="top"`; `PaymentForm` renders `placement="payment"`. Exactly one shows.
-- Top only when billing address and shipping method were known when checkout loaded (signed-in shopper with saved addresses, or digital-only cart with billing). Otherwise the payment methods.
+- Top for signed-in shoppers (`getCustomer().isGuest === false`, not latched, so signing in mid-checkout moves it up), or when billing address and shipping method were known when checkout loaded. Otherwise the payment methods.
+- A signed-in shopper can open Shop Pay before checkout has a consignment; `onShippingAddressChanged` then creates one with `updateShippingAddress` before re-selecting a shipping option.
 - Readiness is recorded once per cart id in `ShopPayCheckoutControl` (`initialReadinessByCartId`); tests call `resetShopPayPlacement()` in `beforeEach`.
 - Reloading after entering addresses mid-checkout shows the top button, because BigCommerce kept the addresses.
 
