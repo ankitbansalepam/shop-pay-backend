@@ -14,11 +14,11 @@
 
 import 'dotenv/config';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import cors from 'cors';
 
+import { createSessionStore, sessionStoreKind } from './sessionStore.js';
 import { validateCart, validateFinalPaymentRequest, validateTotalMatchesCheckout } from './validation.js';
 
 const {
@@ -44,36 +44,8 @@ if (!SHOPIFY_WEBHOOK_SECRET) console.warn('[warn] SHOPIFY_WEBHOOK_SECRET is empt
 
 const STOREFRONT_ENDPOINT = `https://${SHOP_DOMAIN}/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-const orderMap = new Map();
 const CONFIRMATION_TOKEN_TTL_MS = 15 * 60 * 1000;
-const sessionStorePath = path.resolve(process.cwd(), SESSION_STORE_PATH);
-
-function persistOrderMap() {
-    const directory = path.dirname(sessionStorePath);
-    const temporaryPath = `${sessionStorePath}.tmp`;
-
-    fs.mkdirSync(directory, { recursive: true });
-    fs.writeFileSync(temporaryPath, JSON.stringify([...orderMap.entries()], null, 2));
-    fs.renameSync(temporaryPath, sessionStorePath);
-}
-
-function loadOrderMap() {
-    try {
-        const entries = JSON.parse(fs.readFileSync(sessionStorePath, 'utf8'));
-
-        if (Array.isArray(entries)) {
-            for (const [sourceIdentifier, record] of entries) {
-                if (typeof sourceIdentifier === 'string' && record && typeof record === 'object') {
-                    orderMap.set(sourceIdentifier, record);
-                }
-            }
-        }
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            console.error('[session-store] failed to load persisted sessions:', error);
-        }
-    }
-}
+const sessionStore = createSessionStore(path.resolve(process.cwd(), SESSION_STORE_PATH));
 
 const app = express();
 
@@ -194,7 +166,7 @@ app.post('/shop-pay/session', async (req, res) => {
             return res.status(400).json({ error: 'Invalid sourceIdentifier' });
         }
 
-        const existingRecord = orderMap.get(sourceIdentifier);
+        const existingRecord = await sessionStore.get(sourceIdentifier);
         if (existingRecord && existingRecord.status !== 'session_created') {
             return res.status(409).json({ error: 'This Shop Pay session has already been submitted' });
         }
@@ -210,7 +182,7 @@ app.post('/shop-pay/session', async (req, res) => {
 
         const session = payload.shopPayPaymentRequestSession;
         // Remember what we sent, so /submit can resend the same paymentRequest.
-        orderMap.set(sourceIdentifier, {
+        await sessionStore.save({
             bcCartId: cart.cartId,
             bcOrderId: req.body.bcOrderId || null,
             confirmationToken: crypto.randomBytes(32).toString('hex'),
@@ -220,7 +192,6 @@ app.post('/shop-pay/session', async (req, res) => {
             status: 'session_created',
             createdAt: Date.now(),
         });
-        persistOrderMap();
 
         return res.json({
             token: session.token,
@@ -257,7 +228,7 @@ app.post('/shop-pay/submit', async (req, res) => {
             paymentRequest: finalPaymentRequest,
             billingAddress,
         } = req.body || {};
-        const record = orderMap.get(sourceIdentifier);
+        const record = await sessionStore.get(sourceIdentifier);
         if (!record) return res.status(404).json({ error: 'Unknown sourceIdentifier — create a session first' });
         if (typeof sourceIdentifier !== 'string' || sourceIdentifier.length > 200) {
             return res.status(400).json({ error: 'Invalid sourceIdentifier' });
@@ -272,7 +243,7 @@ app.post('/shop-pay/submit', async (req, res) => {
             return res.json(record.submitResponse);
         }
         record.idempotencyKey = idempotencyKey;
-        persistOrderMap();
+        await sessionStore.save(record);
 
         // Reuse the exact paymentRequest we created the session with (server-side
         // source of truth). For POC we trust our stored copy over client input.
@@ -330,7 +301,7 @@ app.post('/shop-pay/submit', async (req, res) => {
             confirmationToken: record.confirmationToken,
         };
         record.submitResponse = response;
-        persistOrderMap();
+        await sessionStore.save(record);
         return res.json(response);
     } catch (err) {
         console.error('[submit] error:', err);
@@ -381,7 +352,7 @@ async function reconcileBigCommerceOrder(record) {
     }
 
     record.bigCommerceStatusId = Number(BIGCOMMERCE_PAID_STATUS_ID);
-    persistOrderMap();
+    await sessionStore.save(record);
     console.log(`[webhook] marked BigCommerce order ${record.bcOrderId} paid for Shopify order ${record.shopifyOrderName}`);
 }
 
@@ -410,7 +381,7 @@ async function clearBigCommerceCart(record) {
         if (response.status === 404) {
             console.log(`[shop-pay] cart ${record.bcCartId} already removed; continuing`);
             record.cartCleared = true;
-                persistOrderMap();
+                await sessionStore.save(record);
             return;
         }
 
@@ -420,7 +391,7 @@ async function clearBigCommerceCart(record) {
         }
 
         record.cartCleared = true;
-        persistOrderMap();
+        await sessionStore.save(record);
         console.log(`[shop-pay] cleared BigCommerce cart ${record.bcCartId} after order ${record.bcOrderId}`);
     } catch (err) {
         console.error('[shop-pay] failed to clear cart after order completion:', err);
@@ -536,21 +507,21 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
     const order = await response.json();
     if (!response.ok) throw new Error(`BigCommerce order creation failed: ${JSON.stringify(order)}`);
     record.bcOrderId = order.id;
-    persistOrderMap();
+    await sessionStore.save(record);
     await reconcileBigCommerceOrder(record);
     record.status = 'bigcommerce_order_created';
-    persistOrderMap();
+    await sessionStore.save(record);
     return order.id;
 }
 
-app.post('/webhooks/shopify/orders', (req, res) => {
+app.post('/webhooks/shopify/orders', async (req, res) => {
     if (!verifyShopifyHmac(req)) return res.status(401).send('Invalid HMAC');
 
     const order = JSON.parse(req.body.toString('utf8'));
     // Shop Pay Wallet echoes our sourceIdentifier back on the order so we can link it.
     const sourceIdentifier = order.source_identifier || order.note_attributes?.find?.((a) => a.name === 'sourceIdentifier')?.value;
 
-    const record = sourceIdentifier && orderMap.get(sourceIdentifier);
+    const record = sourceIdentifier && (await sessionStore.get(sourceIdentifier));
     if (record) {
         if (record.shopifyOrderId && String(record.shopifyOrderId) === String(order.id)) {
             return res.status(200).send('ok');
@@ -560,13 +531,15 @@ app.post('/webhooks/shopify/orders', (req, res) => {
         record.shopifyOrderName = order.name;
         record.financialStatus = order.financial_status;
         record.status = 'order_reconciled';
-        persistOrderMap();
+        await sessionStore.save(record);
         console.log(`[webhook] linked Shopify order ${order.name} (${order.financial_status}) -> BC cart ${record.bcCartId}`);
-        reconcileBigCommerceOrder(record).catch((err) => {
+        try {
+            await reconcileBigCommerceOrder(record);
+        } catch (err) {
             console.error('[webhook] BigCommerce reconciliation error:', err);
             record.status = 'reconciliation_failed';
-            persistOrderMap();
-        });
+            await sessionStore.save(record);
+        }
     } else {
         console.log(`[webhook] order ${order.name} with no matching sourceIdentifier=${sourceIdentifier}`);
     }
@@ -576,9 +549,7 @@ app.post('/webhooks/shopify/orders', (req, res) => {
 app.get('/bigcommerce/orders/:id', async (req, res) => {
     try {
         const confirmationToken = req.get('X-Shop-Pay-Confirmation-Token');
-        const record = [...orderMap.values()].find(
-            (entry) => entry.bcOrderId && String(entry.bcOrderId) === String(req.params.id),
-        );
+        const record = await sessionStore.getByOrderId(req.params.id);
         if (
             !record ||
             !confirmationToken ||
@@ -626,8 +597,7 @@ app.get('/bigcommerce/orders/:id', async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/health', (_req, res) => res.json({ ok: true, shopId: SHOP_ID, endpoint: STOREFRONT_ENDPOINT }));
 
-loadOrderMap();
-console.log(`[session-store] loaded ${orderMap.size} persisted session(s) from ${sessionStorePath}`);
+console.log(`[session-store] using ${sessionStoreKind}`);
 
 app.listen(PORT, () => {
     console.log(`Shop Pay POC backend on http://localhost:${PORT}`);
