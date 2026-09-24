@@ -32,7 +32,8 @@ const {
     BIGCOMMERCE_CREATE_ORDER = 'false',
     PORT = 8787,
     ALLOWED_ORIGIN = '',
-    SESSION_STORE_PATH = 'data/shop-pay-sessions.json',
+    // Vercel's filesystem is read-only except /tmp.
+    SESSION_STORE_PATH = process.env.VERCEL ? '/tmp/shop-pay-sessions.json' : 'data/shop-pay-sessions.json',
 } = process.env;
 
 if (!SHOP_DOMAIN) console.warn('[warn] SHOP_DOMAIN is empty — set it in .env (e.g. your-store.myshopify.com)');
