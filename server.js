@@ -26,6 +26,7 @@ const {
     SHOP_ID,
     STOREFRONT_API_TOKEN,
     SHOPIFY_WEBHOOK_SECRET,
+    ADMIN_API_TOKEN,
     SHOPIFY_API_VERSION = '2025-07',
     BIGCOMMERCE_STORE_HASH = '',
     BIGCOMMERCE_ACCESS_TOKEN = '',
@@ -170,6 +171,15 @@ app.post('/shop-pay/session', async (req, res) => {
         if (existingRecord && existingRecord.status !== 'session_created') {
             return res.status(409).json({ error: 'This Shop Pay session has already been submitted' });
         }
+        // A repeated request for the same attempt gets the same Shopify session; a second
+        // session would leave the popup paying one while /submit submits the other.
+        if (existingRecord?.token && existingRecord.checkoutUrl) {
+            return res.json({
+                token: existingRecord.token,
+                checkoutUrl: existingRecord.checkoutUrl,
+                sourceIdentifier,
+            });
+        }
 
         const paymentRequest = buildPaymentRequest(cart);
 
@@ -188,6 +198,7 @@ app.post('/shop-pay/session', async (req, res) => {
             confirmationToken: crypto.randomBytes(32).toString('hex'),
             sourceIdentifier,
             token: session.token,
+            checkoutUrl: session.checkoutUrl,
             paymentRequest,
             status: 'session_created',
             createdAt: Date.now(),
@@ -291,20 +302,112 @@ app.post('/shop-pay/submit', async (req, res) => {
             return res.status(422).json({ userErrors: payload.userErrors });
         }
 
+        // Submitting only starts payment processing; the BigCommerce order is created by
+        // /shop-pay/complete once Shopify has a paid order for this session.
         record.status = 'submitted';
         record.receipt = payload.paymentRequestReceipt;
         record.finalPaymentRequest = paymentRequest;
-        const bcOrderId = await createBigCommerceOrder(record, paymentRequest, billingAddress);
-        const response = {
-            receipt: payload.paymentRequestReceipt,
-            bcOrderId: bcOrderId || record.bcOrderId || undefined,
-            confirmationToken: record.confirmationToken,
-        };
+        record.billingAddress = billingAddress || null;
+        console.log(
+            `[submit] ${sourceIdentifier} submitted; processing status ${payload.paymentRequestReceipt?.processingStatusType}`,
+        );
+        const response = { receipt: payload.paymentRequestReceipt };
         record.submitResponse = response;
         await sessionStore.save(record);
         return res.json(response);
     } catch (err) {
         console.error('[submit] error:', err);
+        return res.status(500).json({ error: String(err.message || err) });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// 2b) Complete  (fired on paymentcomplete) — the BigCommerce order is created only
+//     once Shopify has a paid order for this session, so a failed payment never
+//     leaves a "paid" BigCommerce order behind.
+// ---------------------------------------------------------------------------
+const RECENT_ORDERS = /* GraphQL */ `
+  query shopPayRecentOrders($query: String!) {
+    orders(first: 20, reverse: true, sortKey: CREATED_AT, query: $query) {
+      nodes { id name sourceIdentifier displayFinancialStatus totalPriceSet { shopMoney { amount } } }
+    }
+  }
+`;
+const PAID_FINANCIAL_STATUSES = new Set(['PAID', 'AUTHORIZED']);
+const COMPLETE_ATTEMPTS = 4;
+const COMPLETE_RETRY_MS = 2000;
+
+async function findShopifyOrder(record) {
+    const since = new Date(record.createdAt - 60 * 1000).toISOString();
+    const response = await fetch(`https://${SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': ADMIN_API_TOKEN },
+        body: JSON.stringify({ query: RECENT_ORDERS, variables: { query: `created_at:>='${since}'` } }),
+    });
+    const json = await response.json();
+
+    if (!response.ok || json.errors) {
+        throw new Error(`Shopify Admin API error: ${JSON.stringify(json.errors || response.status)}`);
+    }
+
+    return json.data.orders.nodes.find((order) => order.sourceIdentifier === record.sourceIdentifier) || null;
+}
+
+app.post('/shop-pay/complete', async (req, res) => {
+    try {
+        const { sourceIdentifier } = req.body || {};
+        if (typeof sourceIdentifier !== 'string' || sourceIdentifier.length > 200) {
+            return res.status(400).json({ error: 'Invalid sourceIdentifier' });
+        }
+
+        const record = await sessionStore.get(sourceIdentifier);
+        if (!record) return res.status(404).json({ error: 'Unknown sourceIdentifier — create a session first' });
+        if (record.completedAt) {
+            return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
+        }
+        if (record.status !== 'submitted' || !record.finalPaymentRequest) {
+            return res.status(409).json({ error: 'This Shop Pay session has not been submitted' });
+        }
+
+        let order = null;
+        for (let attempt = 0; attempt < COMPLETE_ATTEMPTS && !order; attempt += 1) {
+            if (attempt) await new Promise((resolve) => setTimeout(resolve, COMPLETE_RETRY_MS));
+            order = await findShopifyOrder(record);
+        }
+
+        if (!order || !PAID_FINANCIAL_STATUSES.has(order.displayFinancialStatus)) {
+            // Shopify creates the order shortly after the payment; the client asks again.
+            return res.status(202).json({ pending: true, financialStatus: order?.displayFinancialStatus || null });
+        }
+
+        const paid = Number(order.totalPriceSet?.shopMoney?.amount);
+        const expected = Number(record.finalPaymentRequest.total?.amount);
+        if (!(Math.abs(paid - expected) <= 0.01 + 1e-9)) {
+            console.error(`[complete] ${sourceIdentifier}: Shopify ${order.name} paid ${paid}, expected ${expected}`);
+            return res.status(409).json({ error: 'The Shopify payment does not match the order total' });
+        }
+
+        record.shopifyOrderId = order.id;
+        record.shopifyOrderName = order.name;
+        record.financialStatus = order.displayFinancialStatus;
+
+        if (record.bcOrderId) {
+            await reconcileBigCommerceOrder(record);
+        } else {
+            await createBigCommerceOrder(record, record.finalPaymentRequest, record.billingAddress);
+        }
+
+        if (!record.bcOrderId) {
+            return res.status(500).json({ error: 'The BigCommerce order was not created' });
+        }
+
+        record.completedAt = Date.now();
+        await sessionStore.save(record);
+        console.log(`[complete] ${sourceIdentifier}: Shopify ${order.name} paid -> BigCommerce order ${record.bcOrderId}`);
+
+        return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
+    } catch (err) {
+        console.error('[complete] error:', err);
         return res.status(500).json({ error: String(err.message || err) });
     }
 });
