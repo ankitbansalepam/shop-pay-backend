@@ -57,7 +57,7 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 
 ## Backend safeguards
 
-- Persist session mappings; locally `data/shop-pay-sessions.json`, on Vercel `/tmp/shop-pay-sessions.json` (per instance, ephemeral). Use managed Redis/Postgres for production; move to Upstash Redis if submits intermittently return `Unknown sourceIdentifier`.
+- Sessions are stored in Upstash Redis (`upstash-kv-cobalt-drawer`, iad1, connected via Vercel Marketplace; env `KV_REST_API_URL`/`KV_REST_API_TOKEN`), keyed `shop-pay:session:{sourceIdentifier}` plus `shop-pay:order:{bcOrderId}`, 7-day TTL. Without those env vars `sessionStore.js` falls back to a JSON file (`SESSION_STORE_PATH`), which suits only a single local process. The startup log says which store is in use.
 - Verify webhook HMAC using the raw request body and set a real `SHOPIFY_WEBHOOK_SECRET` before enabling webhook processing.
 - Treat duplicate Shopify order webhooks as idempotent.
 - Current flow creates the BigCommerce order during `/shop-pay/submit`; the webhook reconciles it. Do not claim full webhook-created order flow without changing this contract.
@@ -99,5 +99,5 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 
 - Core MVP flow is implemented: Shop Pay session, payment request, address/delivery updates, discount updates, submit, BigCommerce order creation, confirmation display, and delayed cart cleanup.
 - Remaining MVP work: ATP eligibility checks and ATP delivery time slots (SHP-06, SHP-15, SHP-25).
-- Partially implemented: webhook setup/order reconciliation (listener and duplicate protection exist, but current BigCommerce creation is submit-time); session persistence is local JSON / Vercel `/tmp`, not managed storage.
+- Partially implemented: webhook setup/order reconciliation (listener and duplicate protection exist, but current BigCommerce creation is submit-time). Session persistence (SHP-12) is done: Upstash Redis.
 - Out of scope per the sheet: CI/CD, reconciliation job, fulfillment sync/monitoring, fraud integration, OmniTracks, truck eligibility extension, and Google address correction.

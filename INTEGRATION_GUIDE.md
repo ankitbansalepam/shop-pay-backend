@@ -60,7 +60,8 @@ Environment variables (`.env`, never committed/exposed):
 | `BIGCOMMERCE_CREATE_ORDER` | `true` to enable BigCommerce order creation |
 | `ALLOWED_ORIGIN` | Comma-separated CORS allowlist (the checkout origin) |
 | `PORT` | Local backend port (`8787`); ignored on Vercel |
-| `SESSION_STORE_PATH` | Session store file; defaults to `data/shop-pay-sessions.json`, or `/tmp/shop-pay-sessions.json` on Vercel |
+| `KV_REST_API_URL` / `KV_REST_API_TOKEN` | Upstash Redis session store, added by the Vercel Marketplace integration (`UPSTASH_REDIS_REST_URL`/`_TOKEN` also work) |
+| `SESSION_STORE_PATH` | Local fallback session file when Redis isn't configured (default `data/shop-pay-sessions.json`) |
 
 Routes:
 
@@ -272,10 +273,7 @@ Optional overrides: `SHOP_PAY_DEMO_STORE_URL`, `SHOP_PAY_DEMO_PRODUCT_ID`,
 
 ## Known limitations / follow-ups
 
-- `orderMap` is persisted to a JSON file. On Vercel that file lives in `/tmp`, which is
-  per instance and ephemeral, so a submit handled by a different instance than the
-  session can fail with `Unknown sourceIdentifier`. Replace with managed Redis/Postgres
-  (e.g. Upstash) before going beyond POC.
+- Sessions are stored in Upstash Redis (`sessionStore.js`), shared by every Vercel instance, with a 7-day TTL. Without Redis credentials the backend falls back to a JSON file, which suits only one local process.
 - Card selection inside the Shop Pay popup is controlled by Shopify. The checkout can't
   preselect a saved card; see the last entry under Challenges.
 - There's no real BigCommerce Shop Pay payment method/gateway — orders are created
@@ -348,3 +346,7 @@ Optional overrides: `SHOP_PAY_DEMO_STORE_URL`, `SHOP_PAY_DEMO_PRODUCT_ID`,
   payment method" until the shopper clicked the card. Card selection is owned by Shopify
   and the Shop Pay Payment Request API has no way to preselect it; if it persists,
   re-add the card in test mode or raise it with Shopify.
+- **"Unknown sourceIdentifier" on some payments.** Sessions were saved to each Vercel
+  instance's own `/tmp` file, so when Pay now reached a different instance than the
+  one that created the session, the session wasn't found. Fixed by moving sessions to
+  Upstash Redis, connected through the Vercel Marketplace.
