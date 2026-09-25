@@ -363,3 +363,12 @@ Optional overrides: `SHOP_PAY_DEMO_STORE_URL`, `SHOP_PAY_DEMO_PRODUCT_ID`,
   the backend submitted the other. Fixed by creating the BigCommerce order in
   `/shop-pay/complete` only after the Admin API shows a paid Shopify order for the
   session, and by creating one session per attempt.
+- **Webhook signed with a secret nobody could see.** The `orders/create` webhook had been
+  created through the Admin API by the Shop channel app and still pointed at an old ngrok
+  tunnel. After re-pointing it at Vercel, every delivery failed HMAC verification: Shopify
+  signs app-created webhooks with the app's secret, which the Shop channel app doesn't
+  show. Fixed by creating the webhook in Shopify Admin (Settings → Notifications), whose
+  signing key is shown there, and deleting the app-created one. The webhook now also
+  creates the BigCommerce order when checkout never completes the payment, and
+  `/health/webhooks` (daily cron) reports rejected or failed deliveries and paid orders
+  without a BigCommerce order.
