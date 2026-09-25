@@ -15,7 +15,7 @@
   "crons": [
     {
       "path": "/health/webhooks",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 9 * * *"
     }
   ]
 }
