@@ -11,5 +11,11 @@
       "src": "/(.*)",
       "dest": "/server.js"
     }
+  ],
+  "crons": [
+    {
+      "path": "/health/webhooks",
+      "schedule": "*/15 * * * *"
+    }
   ]
 }

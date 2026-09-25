@@ -35,6 +35,7 @@ const {
     STOREFRONT_API_TOKEN,
     SHOPIFY_WEBHOOK_SECRET,
     ADMIN_API_TOKEN,
+    CRON_SECRET,
     SHOPIFY_API_VERSION = '2025-07',
     BIGCOMMERCE_STORE_HASH = '',
     BIGCOMMERCE_ACCESS_TOKEN = '',
@@ -340,6 +341,7 @@ app.post('/shop-pay/submit', async (req, res) => {
         const response = { receipt: payload.paymentRequestReceipt };
         record.submitResponse = response;
         await sessionStore.save(record);
+        await sessionStore.markPending(sourceIdentifier, Date.now());
         return res.json(response);
     } catch (err) {
         console.error('[submit] error:', err);
@@ -379,79 +381,103 @@ async function findShopifyOrder(record) {
     return json.data.orders.nodes.find((order) => order.sourceIdentifier === record.sourceIdentifier) || null;
 }
 
-app.post('/shop-pay/complete', async (req, res) => {
-    let completeLock;
+class CompletionError extends Error {
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+    }
+}
 
+// Creates (or marks paid) the BigCommerce order for a session whose Shopify order is paid.
+// Used by /shop-pay/complete and by the orders/create webhook; callers hold the session's
+// completion lock, so a payment creates exactly one BigCommerce order.
+async function completeWithShopifyOrder(record, order) {
+    if (record.completedAt) return record;
+    if (!PAID_FINANCIAL_STATUSES.has(order.displayFinancialStatus)) {
+        throw new CompletionError(202, 'The Shopify order is not paid yet');
+    }
+
+    const paid = Number(order.totalPriceSet?.shopMoney?.amount);
+    const expected = Number(record.finalPaymentRequest?.total?.amount);
+    if (!(Math.abs(paid - expected) <= 0.01 + 1e-9)) {
+        console.error(`[complete] ${record.sourceIdentifier}: Shopify ${order.name} paid ${paid}, expected ${expected}`);
+        throw new CompletionError(409, 'The Shopify payment does not match the order total');
+    }
+
+    record.shopifyOrderId = order.id;
+    record.shopifyOrderName = order.name;
+    record.financialStatus = order.displayFinancialStatus;
+
+    if (record.bcOrderId) {
+        await reconcileBigCommerceOrder(record);
+    } else {
+        await createBigCommerceOrder(record, record.finalPaymentRequest, record.billingAddress);
+    }
+
+    if (!record.bcOrderId) throw new CompletionError(500, 'The BigCommerce order was not created');
+
+    record.completedAt = Date.now();
+    await sessionStore.save(record);
+    await sessionStore.clearPending(record.sourceIdentifier);
+    console.log(`[complete] ${record.sourceIdentifier}: Shopify ${order.name} paid -> BigCommerce order ${record.bcOrderId}`);
+    return record;
+}
+
+// Runs fn while holding the session's completion lock; { busy: true } if another call has it.
+async function withCompletionLock(sourceIdentifier, fn) {
+    const name = `complete:${sourceIdentifier}`;
+    if (!(await sessionStore.lock(name))) return { busy: true };
+
+    try {
+        return { value: await fn() };
+    } finally {
+        await sessionStore.unlock(name).catch((err) => console.error('[complete] unlock failed:', err));
+    }
+}
+
+app.post('/shop-pay/complete', async (req, res) => {
     try {
         const { sourceIdentifier } = req.body || {};
         if (typeof sourceIdentifier !== 'string' || sourceIdentifier.length > 200) {
             return res.status(400).json({ error: 'Invalid sourceIdentifier' });
         }
 
-        let record = await sessionStore.get(sourceIdentifier);
+        const record = await sessionStore.get(sourceIdentifier);
         if (!record) return res.status(404).json({ error: 'Unknown sourceIdentifier — create a session first' });
         if (record.completedAt) {
             return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
         }
 
-        // Only one call may create the BigCommerce order; a concurrent call is told to
-        // retry, and then receives the order the first call created.
-        if (!(await sessionStore.lock(`complete:${sourceIdentifier}`))) {
-            return res.status(202).json({ pending: true });
-        }
-        completeLock = `complete:${sourceIdentifier}`;
-        record = await sessionStore.get(sourceIdentifier);
-        if (record.completedAt) {
-            return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
-        }
-        if (record.status !== 'submitted' || !record.finalPaymentRequest) {
-            return res.status(409).json({ error: 'This Shop Pay session has not been submitted' });
-        }
+        const result = await withCompletionLock(sourceIdentifier, async () => {
+            const current = await sessionStore.get(sourceIdentifier);
+            if (current.completedAt) return current;
+            if (current.status !== 'submitted' || !current.finalPaymentRequest) {
+                throw new CompletionError(409, 'This Shop Pay session has not been submitted');
+            }
 
-        let order = null;
-        for (let attempt = 0; attempt < COMPLETE_ATTEMPTS && !order; attempt += 1) {
-            if (attempt) await new Promise((resolve) => setTimeout(resolve, COMPLETE_RETRY_MS));
-            order = await findShopifyOrder(record);
-        }
-
-        if (!order || !PAID_FINANCIAL_STATUSES.has(order.displayFinancialStatus)) {
+            let order = null;
+            for (let attempt = 0; attempt < COMPLETE_ATTEMPTS && !order; attempt += 1) {
+                if (attempt) await new Promise((resolve) => setTimeout(resolve, COMPLETE_RETRY_MS));
+                order = await findShopifyOrder(current);
+            }
             // Shopify creates the order shortly after the payment; the client asks again.
-            return res.status(202).json({ pending: true, financialStatus: order?.displayFinancialStatus || null });
-        }
+            if (!order) throw new CompletionError(202, 'The Shopify order does not exist yet');
 
-        const paid = Number(order.totalPriceSet?.shopMoney?.amount);
-        const expected = Number(record.finalPaymentRequest.total?.amount);
-        if (!(Math.abs(paid - expected) <= 0.01 + 1e-9)) {
-            console.error(`[complete] ${sourceIdentifier}: Shopify ${order.name} paid ${paid}, expected ${expected}`);
-            return res.status(409).json({ error: 'The Shopify payment does not match the order total' });
-        }
+            return completeWithShopifyOrder(current, order);
+        });
 
-        record.shopifyOrderId = order.id;
-        record.shopifyOrderName = order.name;
-        record.financialStatus = order.displayFinancialStatus;
+        // Another call (or the webhook) is completing this session; the client asks again.
+        if (result.busy) return res.status(202).json({ pending: true });
 
-        if (record.bcOrderId) {
-            await reconcileBigCommerceOrder(record);
-        } else {
-            await createBigCommerceOrder(record, record.finalPaymentRequest, record.billingAddress);
-        }
-
-        if (!record.bcOrderId) {
-            return res.status(500).json({ error: 'The BigCommerce order was not created' });
-        }
-
-        record.completedAt = Date.now();
-        await sessionStore.save(record);
-        console.log(`[complete] ${sourceIdentifier}: Shopify ${order.name} paid -> BigCommerce order ${record.bcOrderId}`);
-
-        return res.json({ bcOrderId: record.bcOrderId, confirmationToken: record.confirmationToken });
+        return res.json({ bcOrderId: result.value.bcOrderId, confirmationToken: result.value.confirmationToken });
     } catch (err) {
+        if (err instanceof CompletionError) {
+            return err.status === 202
+                ? res.status(202).json({ pending: true })
+                : res.status(err.status).json({ error: err.message });
+        }
         console.error('[complete] error:', err);
         return res.status(500).json({ error: String(err.message || err) });
-    } finally {
-        if (completeLock) {
-            await sessionStore.unlock(completeLock).catch((err) => console.error('[complete] unlock failed:', err));
-        }
     }
 });
 
@@ -740,36 +766,89 @@ async function createBigCommerceOrder(record, paymentRequest, billingAddress) {
     return order.id;
 }
 
+const WEBHOOK_HEALTH_KEY = 'webhook-health';
+
+// Records webhook deliveries for /health/webhooks: kind is received, rejected or failed.
+async function recordWebhookHealth(kind, detail) {
+    try {
+        const health = (await sessionStore.getJson(WEBHOOK_HEALTH_KEY)) || {};
+        const label = kind[0].toUpperCase() + kind.slice(1);
+
+        health[`last${label}At`] = Date.now();
+        health[`${kind}Count`] = (health[`${kind}Count`] || 0) + 1;
+        if (detail) health[`last${label}Detail`] = String(detail).slice(0, 300);
+        await sessionStore.setJson(WEBHOOK_HEALTH_KEY, health);
+    } catch (err) {
+        console.error('[webhook] could not record webhook health:', err);
+    }
+}
+
+// Safety net for checkout: if the shopper paid but checkout never called /shop-pay/complete
+// (e.g. the tab was closed), the orders/create webhook creates the BigCommerce order.
 app.post('/webhooks/shopify/orders', async (req, res) => {
-    if (!verifyShopifyHmac(req)) return res.status(401).send('Invalid HMAC');
+    if (!verifyShopifyHmac(req)) {
+        await recordWebhookHealth('rejected', `HMAC mismatch for ${req.get('X-Shopify-Topic') || 'unknown topic'}`);
+        return res.status(401).send('Invalid HMAC');
+    }
 
-    const order = JSON.parse(req.body.toString('utf8'));
+    let order;
+    try {
+        order = JSON.parse(req.body.toString('utf8'));
+    } catch {
+        await recordWebhookHealth('failed', 'Invalid JSON body');
+        return res.status(400).send('Invalid JSON');
+    }
+
     // Shop Pay Wallet echoes our sourceIdentifier back on the order so we can link it.
-    const sourceIdentifier = order.source_identifier || order.note_attributes?.find?.((a) => a.name === 'sourceIdentifier')?.value;
+    const sourceIdentifier =
+        order.source_identifier || order.note_attributes?.find?.((a) => a.name === 'sourceIdentifier')?.value;
+    await recordWebhookHealth('received', order.name);
 
-    const record = sourceIdentifier && (await sessionStore.get(sourceIdentifier));
-    if (record) {
-        if (record.shopifyOrderId && String(record.shopifyOrderId) === String(order.id)) {
+    try {
+        const record = sourceIdentifier && (await sessionStore.get(sourceIdentifier));
+        if (!record) {
+            console.log(`[webhook] order ${order.name} with no matching sourceIdentifier=${sourceIdentifier}`);
             return res.status(200).send('ok');
         }
 
-        record.shopifyOrderId = order.id;
-        record.shopifyOrderName = order.name;
-        record.financialStatus = order.financial_status;
-        record.status = 'order_reconciled';
-        await sessionStore.save(record);
-        console.log(`[webhook] linked Shopify order ${order.name} (${order.financial_status}) -> BC cart ${record.bcCartId}`);
-        try {
-            await reconcileBigCommerceOrder(record);
-        } catch (err) {
-            console.error('[webhook] BigCommerce reconciliation error:', err);
-            record.status = 'reconciliation_failed';
-            await sessionStore.save(record);
+        if (record.completedAt) {
+            // Checkout already created the BigCommerce order; make sure it is marked paid.
+            if (!record.bigCommerceStatusId) await reconcileBigCommerceOrder(record);
+            return res.status(200).send('ok');
         }
-    } else {
-        console.log(`[webhook] order ${order.name} with no matching sourceIdentifier=${sourceIdentifier}`);
+
+        if (record.status !== 'submitted' || !record.finalPaymentRequest) {
+            console.warn(`[webhook] ${order.name}: session ${sourceIdentifier} was never submitted; not creating an order`);
+            return res.status(200).send('ok');
+        }
+
+        const shopifyOrder = {
+            id: order.admin_graphql_api_id || String(order.id),
+            name: order.name,
+            displayFinancialStatus: String(order.financial_status || '').toUpperCase(),
+            totalPriceSet: { shopMoney: { amount: order.total_price } },
+        };
+        const result = await withCompletionLock(sourceIdentifier, async () => {
+            const current = await sessionStore.get(sourceIdentifier);
+            return current.completedAt ? current : completeWithShopifyOrder(current, shopifyOrder);
+        });
+
+        if (result.busy) {
+            console.log(`[webhook] ${order.name}: checkout is completing ${sourceIdentifier}`);
+        } else {
+            console.log(`[webhook] ${order.name} -> BigCommerce order ${result.value.bcOrderId}`);
+        }
+        return res.status(200).send('ok');
+    } catch (err) {
+        if (err instanceof CompletionError && err.status === 202) {
+            console.log(`[webhook] ${order.name} is not paid yet (${order.financial_status}); checkout completes it`);
+            return res.status(200).send('ok');
+        }
+        console.error('[webhook] error:', err);
+        await recordWebhookHealth('failed', `${order.name}: ${err.message || err}`);
+        // A non-2xx answer makes Shopify retry the delivery.
+        return res.status(500).send('error');
     }
-    res.status(200).send('ok');
 });
 
 app.get('/bigcommerce/orders/:id', async (req, res) => {
@@ -821,6 +900,106 @@ app.get('/bigcommerce/orders/:id', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Debug + health
 // ---------------------------------------------------------------------------
+const STUCK_PAYMENT_MS = 10 * 60 * 1000;
+const ABANDONED_PAYMENT_MS = 24 * 60 * 60 * 1000;
+const WEBHOOK_SUBSCRIPTIONS = /* GraphQL */ `
+  query shopPayWebhooks {
+    webhookSubscriptions(first: 20, topics: [ORDERS_CREATE]) {
+      nodes { id endpoint { __typename ... on WebhookHttpEndpoint { callbackUrl } } }
+    }
+  }
+`;
+
+async function getOrderWebhookUrls() {
+    const response = await fetch(`https://${SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': ADMIN_API_TOKEN },
+        body: JSON.stringify({ query: WEBHOOK_SUBSCRIPTIONS }),
+    });
+    const json = await response.json();
+
+    if (!response.ok || json.errors) {
+        throw new Error(`Shopify Admin API error: ${JSON.stringify(json.errors || response.status)}`);
+    }
+
+    return json.data.webhookSubscriptions.nodes.map((node) => node.endpoint?.callbackUrl).filter(Boolean);
+}
+
+// Webhook health (SHP-20): run by the Vercel cron (which sends "Authorization: Bearer
+// CRON_SECRET") and callable by hand with the same header. 200 when healthy, 503 otherwise.
+app.get('/health/webhooks', async (req, res) => {
+    if (!CRON_SECRET || req.get('Authorization') !== `Bearer ${CRON_SECRET}`) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const now = Date.now();
+    const expectedUrl = `https://${req.get('host')}/webhooks/shopify/orders`;
+    const problems = [];
+
+    let subscribedUrls = [];
+    try {
+        subscribedUrls = await getOrderWebhookUrls();
+        if (!subscribedUrls.includes(expectedUrl)) problems.push(`No orders/create webhook points at ${expectedUrl}`);
+    } catch (err) {
+        problems.push(`Could not read Shopify webhook subscriptions: ${err.message}`);
+    }
+    if (!SHOPIFY_WEBHOOK_SECRET) problems.push('SHOPIFY_WEBHOOK_SECRET is not set, so every webhook is rejected');
+
+    const webhooks = (await sessionStore.getJson(WEBHOOK_HEALTH_KEY)) || {};
+    if (webhooks.lastRejectedAt && !(webhooks.lastReceivedAt > webhooks.lastRejectedAt)) {
+        problems.push('The latest webhook delivery was rejected: the HMAC secret does not match');
+    }
+    if (webhooks.lastFailedAt && now - webhooks.lastFailedAt < ABANDONED_PAYMENT_MS) {
+        problems.push(`A webhook failed in the last 24 hours: ${webhooks.lastFailedDetail || 'see logs'}`);
+    }
+
+    // A payment is stuck when Shopify has a paid order but BigCommerce has none after 10 minutes.
+    const stuckPayments = [];
+    for (const { sourceIdentifier, submittedAt } of await sessionStore.listPending()) {
+        if (now - submittedAt < STUCK_PAYMENT_MS) continue;
+
+        const record = await sessionStore.get(sourceIdentifier);
+        if (!record || record.completedAt) {
+            await sessionStore.clearPending(sourceIdentifier);
+            continue;
+        }
+
+        let order = null;
+        try {
+            order = await findShopifyOrder(record);
+        } catch (err) {
+            problems.push(`Could not look up the Shopify order for ${sourceIdentifier}: ${err.message}`);
+            continue;
+        }
+
+        if (order && PAID_FINANCIAL_STATUSES.has(order.displayFinancialStatus)) {
+            stuckPayments.push({ sourceIdentifier, shopifyOrder: order.name, submittedAt: new Date(submittedAt).toISOString() });
+        } else if (now - submittedAt > ABANDONED_PAYMENT_MS) {
+            // Never paid (declined or abandoned): stop tracking it.
+            await sessionStore.clearPending(sourceIdentifier);
+        }
+    }
+    if (stuckPayments.length) {
+        problems.push(`${stuckPayments.length} paid Shopify order(s) have no BigCommerce order after 10 minutes`);
+    }
+
+    const report = {
+        ok: problems.length === 0,
+        checkedAt: new Date(now).toISOString(),
+        problems,
+        subscribedUrls,
+        webhooks: Object.fromEntries(
+            Object.entries(webhooks).map(([key, value]) => [key, key.endsWith('At') ? new Date(value).toISOString() : value]),
+        ),
+        stuckPayments,
+    };
+
+    if (problems.length) console.error('[health] webhook problems:', JSON.stringify(problems));
+    else console.log('[health] webhooks healthy');
+
+    return res.status(problems.length ? 503 : 200).json(report);
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true, shopId: SHOP_ID, endpoint: STOREFRONT_ENDPOINT }));
 
 console.log(`[session-store] using ${sessionStoreKind}`);

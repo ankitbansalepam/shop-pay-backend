@@ -13,6 +13,8 @@ const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_A
 const RECORD_TTL_SECONDS = 7 * 24 * 60 * 60;
 const sessionKey = (sourceIdentifier) => `shop-pay:session:${sourceIdentifier}`;
 const orderKey = (bcOrderId) => `shop-pay:order:${bcOrderId}`;
+const metaKey = (name) => `shop-pay:meta:${name}`;
+const PENDING_KEY = 'shop-pay:pending';
 
 export const sessionStoreKind = redisUrl && redisToken ? 'upstash-redis' : 'file';
 
@@ -34,6 +36,8 @@ async function redis(command) {
 function createFileStore(filePath) {
     const records = new Map();
     const locks = new Set();
+    const meta = new Map();
+    const pending = new Map();
 
     try {
         const entries = JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -80,6 +84,21 @@ function createFileStore(filePath) {
         async unlock(name) {
             locks.delete(name);
         },
+        async getJson(name) {
+            return meta.get(name) ?? null;
+        },
+        async setJson(name, value) {
+            meta.set(name, value);
+        },
+        async markPending(sourceIdentifier, submittedAt) {
+            pending.set(sourceIdentifier, submittedAt);
+        },
+        async clearPending(sourceIdentifier) {
+            pending.delete(sourceIdentifier);
+        },
+        async listPending() {
+            return [...pending.entries()].map(([sourceIdentifier, submittedAt]) => ({ sourceIdentifier, submittedAt }));
+        },
     };
 }
 
@@ -107,6 +126,30 @@ const redisStore = {
     },
     async unlock(name) {
         await redis(['DEL', `shop-pay:lock:${name}`]);
+    },
+    async getJson(name) {
+        const value = await redis(['GET', metaKey(name)]);
+
+        return value ? JSON.parse(value) : null;
+    },
+    async setJson(name, value) {
+        await redis(['SET', metaKey(name), JSON.stringify(value)]);
+    },
+    // Submitted payments without a BigCommerce order yet, scored by submit time.
+    async markPending(sourceIdentifier, submittedAt) {
+        await redis(['ZADD', PENDING_KEY, submittedAt, sourceIdentifier]);
+    },
+    async clearPending(sourceIdentifier) {
+        await redis(['ZREM', PENDING_KEY, sourceIdentifier]);
+    },
+    async listPending() {
+        const flat = (await redis(['ZRANGE', PENDING_KEY, 0, -1, 'WITHSCORES'])) || [];
+        const entries = [];
+
+        for (let index = 0; index < flat.length; index += 2) {
+            entries.push({ sourceIdentifier: flat[index], submittedAt: Number(flat[index + 1]) });
+        }
+        return entries;
     },
 };
 
