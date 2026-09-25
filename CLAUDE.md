@@ -39,3 +39,7 @@ This is a Node 20+ Express POC connecting BigCommerce checkout to Shopify Shop P
 - `/shop-pay/submit` only submits the payment. `/shop-pay/complete` creates the BigCommerce order once the Admin API shows a PAID/AUTHORIZED Shopify order with the same `sourceIdentifier` and a matching total; it answers 202 while the order is pending. Never create the BigCommerce order at submit: the payment can still fail afterwards.
 
 Do not change Shopify API versions, GraphQL fields, or payment-flow semantics without checking the relevant Shopify contract.
+
+## Shop Pay open work
+
+Only the items under "Remaining work" in `.claude/skills/shop-pay-integration/SKILL.md` are still open (real ATP API, Apigee, gateway contract, go-live switches, and a few known gaps). Everything else in the estimation sheet is done or out of scope.

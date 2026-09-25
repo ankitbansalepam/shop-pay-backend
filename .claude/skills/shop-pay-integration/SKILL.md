@@ -108,9 +108,28 @@ description: "Use when working on Shop Pay checkout, session conflicts, CORS, Ve
 - Output: `packages/test-framework/videos/shop-pay-demo/` (gitignored), with the MP4, raw `.webm` files, `timeline.json`, and `narration/*.wav`.
 - Form gotchas: select country and state before filling other address fields (changing the country clears them); click `label[for="sameAsBilling"]`, not the hidden checkbox; wait for a `:checked` shipping radio, because BigCommerce ticks it only after the server round-trip.
 
-## Backlog status
+## Remaining work
 
-- Core MVP flow is implemented: Shop Pay session, payment request, address/delivery updates, discount updates, submit, BigCommerce order creation, confirmation display, and delayed cart cleanup.
-- Remaining MVP work: ATP eligibility checks and ATP delivery time slots (SHP-06, SHP-15, SHP-25).
-- Partially implemented: webhook setup/order reconciliation (listener and duplicate protection exist; the BigCommerce order is created by `/shop-pay/complete` after Shopify reports it paid, not by the webhook). Session persistence (SHP-12) is done: Upstash Redis.
-- Out of scope per the sheet: CI/CD, reconciliation job, fulfillment sync/monitoring, fraud integration, OmniTracks, truck eligibility extension, and Google address correction.
+Everything else in the estimation sheet is implemented, out of scope or post-MVP (sheet: `Downloads\Estimation and Resource Plan – ShopPay SleepCountry(new-BacklogEstimation)-updated.csv`, Implementation Status column, updated 2026-09-25). Only these points are open:
+
+**Needs details from Sleep Country**
+1. Real ATP API (SHP-06 eligibility, SHP-15 integration, SHP-25 delivery time slots): the checkout and Shop Pay flow is built against the mock ATP; replace `getAvailableDeliveryDates()` (and `isEligibleAddress()`) in backend `delivery.js`.
+2. Production Apigee in front of the backend (SHP-03).
+3. Gateway contract for API integration and errors (SHP-09).
+
+**Before go-live**
+4. Turn off Shop Pay SDK debug logging (`debug: true` in the `configure` call in `shopPaySdk.ts`).
+5. Switch Shopify Payments from test mode to live.
+6. Remove or replace the test products (112, 113) and the test shipping methods White Glove / Green Glove (US zone methods 3, 4).
+7. Canada: add a Canadian shipping zone with the scheduled services and CAD pricing.
+
+**Gaps in what's built**
+8. Scheduled delivery date is recorded on the order only for Shop Pay payments, not other payment methods.
+9. Scheduled delivery isn't supported with multi-address shipping.
+
+**Outside the code**
+10. Saved card not always preselected in the Shop Pay popup: raise with Shopify.
+11. BigCommerce order 115 is marked paid but was never charged (the user is handling it).
+12. Re-record the demo video (flow changed: placement, confirmation step, scheduled delivery).
+
+Out of scope per the sheet: CI/CD, reconciliation job, fulfillment sync/monitoring, fraud (Signifyd), OmniTracks reservation, truck eligibility extension, Google address correction; returns/refunds are post-MVP.
