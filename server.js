@@ -936,16 +936,24 @@ app.get('/health/webhooks', async (req, res) => {
     const expectedUrl = `https://${req.get('host')}/webhooks/shopify/orders`;
     const problems = [];
 
+    const webhooks = (await sessionStore.getJson(WEBHOOK_HEALTH_KEY)) || {};
+
+    // The orders/create webhook is created in Shopify Admin (Settings → Notifications), so
+    // it is signed with the key shown there; such webhooks aren't visible to the Admin API.
+    // A verified delivery proves it works; app-created subscriptions are listed as a fallback.
     let subscribedUrls = [];
     try {
         subscribedUrls = await getOrderWebhookUrls();
-        if (!subscribedUrls.includes(expectedUrl)) problems.push(`No orders/create webhook points at ${expectedUrl}`);
     } catch (err) {
-        problems.push(`Could not read Shopify webhook subscriptions: ${err.message}`);
+        console.warn('[health] could not read app webhook subscriptions:', err.message);
+    }
+    if (!webhooks.lastReceivedAt && !subscribedUrls.includes(expectedUrl)) {
+        problems.push(
+            `No verified orders/create webhook delivery yet; create one in Shopify Admin (Settings → Notifications → Webhooks) for ${expectedUrl} and send a test notification`,
+        );
     }
     if (!SHOPIFY_WEBHOOK_SECRET) problems.push('SHOPIFY_WEBHOOK_SECRET is not set, so every webhook is rejected');
 
-    const webhooks = (await sessionStore.getJson(WEBHOOK_HEALTH_KEY)) || {};
     if (webhooks.lastRejectedAt && !(webhooks.lastReceivedAt > webhooks.lastRejectedAt)) {
         problems.push('The latest webhook delivery was rejected: the HMAC secret does not match');
     }
